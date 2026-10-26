@@ -11,7 +11,7 @@
 
 AIRcode is an early-stage desktop IDE for Windows, macOS, and Linux. Its goal is to combine a fast, distraction-free editing experience with flexible AI providers while remaining fully usable offline.
 
-The project uses a native GPU interface built with GPUI — no Electron or embedded Chromium. Zed is a performance and functionality reference, not a visual template: AIRcode has its own **Focus Workspace** design where secondary panels appear only when needed.
+The project uses a native GPU interface built with GPUI — no Electron or embedded Chromium. AIRcode has its own **Focus Workspace** design where secondary panels appear only when needed.
 
 ### Current status
 
@@ -99,7 +99,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 AIRcode — IDE на ранней стадии разработки для Windows, macOS и Linux. Цель проекта — объединить быстрое редактирование без лишних отвлечений с гибкими ИИ-провайдерами, сохранив полноценную работу офлайн.
 
-Интерфейс нативный и использует GPU через GPUI — без Electron и встроенного Chromium. Zed является ориентиром по производительности и возможностям, но не визуальным шаблоном: у AIRcode собственный дизайн **Focus Workspace**, в котором второстепенные панели появляются только по необходимости.
+Интерфейс нативный и использует GPU через GPUI — без Electron и встроенного Chromium. У AIRcode собственный дизайн **Focus Workspace**, в котором второстепенные панели появляются только по необходимости.
 
 ### Текущий статус
 
