@@ -1,0 +1,10 @@
+[package]
+name = "aircode-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aircode-core.workspace = true
+gpui.workspace = true
