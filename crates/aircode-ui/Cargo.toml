@@ -6,5 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aircode-ai.workspace = true
 aircode-core.workspace = true
+aircode-editor.workspace = true
 gpui.workspace = true
+rfd = "0.17.2"
+tokio.workspace = true
+tokio-util.workspace = true
+unicode-segmentation = "1.12.0"

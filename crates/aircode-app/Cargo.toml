@@ -5,5 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "aircode"
+path = "src/main.rs"
+
 [dependencies]
 aircode-ui.workspace = true
