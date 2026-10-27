@@ -1,11 +1,11 @@
-use std::{error::Error, fmt, time::Duration};
+use std::{collections::HashMap, error::Error, fmt, time::Duration};
 
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{ApiKey, ChatMessage, ProviderConfig, sse::SseDecoder};
+use crate::{ApiKey, ChatMessage, ProviderConfig, ToolCall, sse::SseDecoder};
 
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
@@ -13,6 +13,8 @@ const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 pub enum StreamEvent {
     ReasoningDelta(String),
     ContentDelta(String),
+    ToolCall(ToolCall),
+    ToolResult(String),
     Usage(serde_json::Value),
     Error(String),
     Done,
@@ -65,6 +67,19 @@ impl AiClient {
         cancel: CancellationToken,
         events: mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), AiError> {
+        self.stream_chat_with_tools(config, api_key, messages, None, cancel, events)
+            .await
+    }
+
+    pub async fn stream_chat_with_tools(
+        &self,
+        config: &ProviderConfig,
+        api_key: &ApiKey,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+        cancel: CancellationToken,
+        events: mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<(), AiError> {
         if config.model.trim().is_empty() {
             return Err(AiError::InvalidEndpoint(
                 "Enter a model ID before sending a message".into(),
@@ -80,7 +95,7 @@ impl AiClient {
                 "Only HTTP and HTTPS are supported".into(),
             ));
         }
-        let body = config.request_body(messages);
+        let body = config.request_body_with_tools(messages, tools);
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(AiError::Cancelled),
             result = self.client
@@ -114,6 +129,7 @@ impl AiClient {
         }
 
         let mut decoder = SseDecoder::new();
+        let mut tool_calls = HashMap::new();
         let mut stream = response.bytes_stream();
         let mut received = 0usize;
         loop {
@@ -131,6 +147,7 @@ impl AiClient {
             }
             for data in decoder.push(&chunk).map_err(AiError::Protocol)? {
                 if data == "[DONE]" {
+                    emit_tool_calls(&mut tool_calls, &events);
                     let _ = events.send(StreamEvent::Done);
                     return Ok(());
                 }
@@ -140,6 +157,7 @@ impl AiClient {
                     let _ = events.send(StreamEvent::Usage(usage));
                 }
                 for choice in chunk.choices {
+                    merge_tool_calls(&mut tool_calls, choice.delta.tool_calls);
                     if let Some(reasoning) = choice.delta.reasoning_content
                         && !reasoning.is_empty()
                     {
@@ -153,6 +171,7 @@ impl AiClient {
                 }
             }
         }
+        emit_tool_calls(&mut tool_calls, &events);
         let _ = events.send(StreamEvent::Done);
         Ok(())
     }
@@ -174,6 +193,51 @@ struct Choice {
 struct Delta {
     content: Option<String>,
     reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallDelta>,
+}
+
+#[derive(Deserialize)]
+struct ToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: ToolFunctionDelta,
+}
+
+#[derive(Deserialize)]
+struct ToolFunctionDelta {
+    name: Option<String>,
+    arguments: String,
+}
+
+fn merge_tool_calls(map: &mut HashMap<usize, ToolCall>, deltas: Vec<ToolCallDelta>) {
+    for delta in deltas {
+        let call = map.entry(delta.index).or_insert_with(|| ToolCall {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        });
+        if let Some(id) = delta.id {
+            call.id = id;
+        }
+        if let Some(name) = delta.function.name {
+            call.name = name;
+        }
+        call.arguments.push_str(&delta.function.arguments);
+    }
+}
+
+fn emit_tool_calls(
+    map: &mut HashMap<usize, ToolCall>,
+    events: &mpsc::UnboundedSender<StreamEvent>,
+) {
+    let mut calls = map.drain().collect::<Vec<_>>();
+    calls.sort_by_key(|(index, _)| *index);
+    for (_, call) in calls {
+        if !call.name.is_empty() {
+            let _ = events.send(StreamEvent::ToolCall(call));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +342,50 @@ mod tests {
         assert!(request.contains("AIRcode/"));
         assert!(request.contains("\"model\":\"k3.1-pro\""));
         assert!(request.contains("\"thinking\":{\"type\":\"enabled\"}"));
+    }
+
+    #[tokio::test]
+    async fn assembles_tool_calls_from_fragments() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"src/main.rs\\\",\\\"content\\\":\\\"fn main() {}\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, _) = server("200 OK", "text/event-stream", body, 3).await;
+        let config = ProviderConfig {
+            base_url,
+            ..ProviderConfig::default()
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        AiClient::new()
+            .unwrap()
+            .stream_chat_with_tools(
+                &config,
+                &key(),
+                &[],
+                Some(serde_json::json!([])),
+                CancellationToken::new(),
+                sender,
+            )
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call-1".into(),
+                    name: "write_file".into(),
+                    arguments: "{\"path\":\"src/main.rs\",\"content\":\"fn main() {}\"}".into(),
+                }),
+                StreamEvent::Done,
+            ]
+        );
     }
 
     #[tokio::test]

@@ -11,3 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 aircode-ui.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.12"

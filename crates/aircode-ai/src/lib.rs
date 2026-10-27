@@ -7,6 +7,6 @@ mod sse;
 pub use client::{AiClient, AiError, StreamEvent};
 pub use credentials::{ApiKey, CredentialStore};
 pub use provider::{
-    ChatMessage, MessageRole, ProviderConfig, ProviderKind, ReasoningEffort, Region,
+    ChatMessage, MessageRole, ProviderConfig, ProviderKind, ReasoningEffort, Region, ToolCall,
 };
 pub use settings::{AppSettings, SettingsStore};

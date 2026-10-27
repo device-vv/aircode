@@ -197,6 +197,22 @@ impl ProviderConfig {
         }
         body
     }
+
+    pub fn request_body_with_tools(&self, messages: &[ChatMessage], tools: Option<Value>) -> Value {
+        let mut body = self.request_body(messages);
+        if let Some(tools) = tools {
+            body["tools"] = tools;
+            body["tool_choice"] = Value::String("auto".into());
+        }
+        body
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

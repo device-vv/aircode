@@ -6,11 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aircode-agent.workspace = true
 aircode-ai.workspace = true
 aircode-core.workspace = true
 aircode-editor.workspace = true
+aircode-i18n.workspace = true
+aircode-project.workspace = true
+aircode-syntax.workspace = true
 gpui.workspace = true
+raw-window-handle = "0.6.2"
 rfd = "0.17.2"
+serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 unicode-segmentation = "1.12.0"

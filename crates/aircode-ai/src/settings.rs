@@ -10,6 +10,11 @@ use crate::{AiError, ProviderConfig};
 pub struct AppSettings {
     pub provider: ProviderConfig,
     pub include_document: bool,
+    pub language: String,
+    pub locale_offer_dismissed: bool,
+    pub left_width: f32,
+    pub right_width: f32,
+    pub permission_mode: String,
 }
 
 impl Default for AppSettings {
@@ -17,6 +22,11 @@ impl Default for AppSettings {
         Self {
             provider: ProviderConfig::default(),
             include_document: true,
+            language: "en".into(),
+            locale_offer_dismissed: false,
+            left_width: 260.0,
+            right_width: 360.0,
+            permission_mode: "ask_important".into(),
         }
     }
 }
@@ -73,6 +83,7 @@ mod tests {
         let settings = AppSettings {
             provider: ProviderConfig::new(ProviderKind::KimiCode),
             include_document: false,
+            ..AppSettings::default()
         };
 
         store.save(&settings).unwrap();

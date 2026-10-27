@@ -1,14 +1,20 @@
-use std::sync::Arc;
+use std::{
+    path::PathBuf,
+    sync::{Arc, mpsc as std_mpsc},
+};
 
+use aircode_agent::{AgentAction, AgentExecutor, PermissionMode, tool_definitions};
 use aircode_ai::{
     AiClient, ApiKey, AppSettings, ChatMessage, CredentialStore, MessageRole, ProviderConfig,
-    ProviderKind, ReasoningEffort, Region, SettingsStore, StreamEvent,
+    ProviderKind, ReasoningEffort, Region, SettingsStore, StreamEvent, ToolCall,
 };
 use aircode_core::{NavigationPanel, ThemeMode, WorkspaceState};
 use aircode_editor::Document;
+use aircode_i18n::{Language, system_is_russian, tr};
+use aircode_project::{Project, RecommendedWatcher};
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable, FontWeight, KeyBinding, Rgba, Window, actions,
-    div, prelude::*, px,
+    App, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight,
+    KeyBinding, MouseButton, Rgba, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 use tokio::{runtime::Runtime, sync::mpsc};
@@ -133,6 +139,7 @@ struct ChatEntry {
     role: MessageRole,
     content: String,
     reasoning: String,
+    show_reasoning: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -146,16 +153,64 @@ enum PaletteCommand {
     Theme,
 }
 
+#[derive(Clone, Copy)]
+enum ResizeTarget {
+    Left,
+    Right,
+}
+
+#[cfg(windows)]
+fn toggle_maximize(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    unsafe extern "system" {
+        fn ShowWindow(window: *mut std::ffi::c_void, command: i32) -> i32;
+    }
+
+    if !window.is_maximized() {
+        window.zoom_window();
+        return;
+    }
+    if let Ok(handle) = HasWindowHandle::window_handle(window)
+        && let RawWindowHandle::Win32(handle) = handle.as_raw()
+    {
+        unsafe {
+            ShowWindow(handle.hwnd.get() as *mut std::ffi::c_void, 9);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn toggle_maximize(window: &Window) {
+    window.zoom_window();
+}
+
 pub struct Workspace {
     state: WorkspaceState,
+    language: Language,
+    offer_russian: bool,
+    dialog_open: bool,
     focus_handle: FocusHandle,
+    resizing: Option<ResizeTarget>,
+    window_origin_x: f32,
+    window_width: f32,
     document: Entity<DocumentView>,
+    project: Option<Project>,
+    project_watcher: Option<RecommendedWatcher>,
+    project_events: Option<std_mpsc::Receiver<()>>,
     chat_input: Entity<TextInput>,
     api_key_input: Entity<TextInput>,
     base_url_input: Entity<TextInput>,
     model_input: Entity<TextInput>,
     settings: AppSettings,
     settings_store: Option<SettingsStore>,
+    permission: PermissionMode,
+    agent_messages: Vec<ChatMessage>,
+    current_config: ProviderConfig,
+    pending_tool: Option<(ToolCall, Option<String>)>,
+    tool_running: bool,
+    agent_steps: u8,
+    audit: Vec<String>,
     settings_open: bool,
     key_saved: bool,
     status: String,
@@ -179,6 +234,10 @@ impl Workspace {
                 status = error.to_string();
                 AppSettings::default()
             });
+        let language = Language::from_code(&settings.language);
+        let offer_russian = language == Language::English
+            && !settings.locale_offer_dismissed
+            && system_is_russian();
         let key_saved = match CredentialStore::load(&settings.provider.credential_id()) {
             Ok(key) => key.is_some(),
             Err(error) => {
@@ -187,15 +246,20 @@ impl Workspace {
             }
         };
         let document = cx.new(DocumentView::new);
+        document.update(cx, |view, _| view.set_language(language));
         cx.observe(&document, |_, _, cx| cx.notify()).detach();
-        let chat_input = cx.new(|cx| TextInput::new("Ask about your code...", cx));
+        let chat_input = cx.new(|cx| TextInput::new(tr(language, "chat_placeholder"), cx));
+        chat_input.update(cx, |input, _| input.set_language(language));
         let api_key_input = cx.new(|cx| {
-            let mut input = TextInput::new("Paste API key", cx);
+            let mut input = TextInput::new(tr(language, "api_key_placeholder"), cx);
             input.set_masked(true);
             input
         });
+        api_key_input.update(cx, |input, _| input.set_language(language));
         let base_url_input = cx.new(|cx| TextInput::new("https://server/v1", cx));
-        let model_input = cx.new(|cx| TextInput::new("Model ID", cx));
+        base_url_input.update(cx, |input, _| input.set_language(language));
+        let model_input = cx.new(|cx| TextInput::new(tr(language, "model_id"), cx));
+        model_input.update(cx, |input, _| input.set_language(language));
         base_url_input.update(cx, |input, cx| {
             input.set_text(settings.provider.base_url.clone(), cx);
         });
@@ -210,12 +274,28 @@ impl Workspace {
         let client = Arc::new(AiClient::new().expect("failed to initialize HTTP client"));
         Self {
             state: WorkspaceState::default(),
+            language,
+            offer_russian,
+            dialog_open: false,
             focus_handle: cx.focus_handle(),
+            resizing: None,
+            window_origin_x: 0.0,
+            window_width: 1440.0,
             document,
+            project: None,
+            project_watcher: None,
+            project_events: None,
             chat_input,
             api_key_input,
             base_url_input,
             model_input,
+            permission: PermissionMode::from_code(&settings.permission_mode),
+            agent_messages: Vec::new(),
+            current_config: settings.provider.clone(),
+            pending_tool: None,
+            tool_running: false,
+            agent_steps: 0,
+            audit: Vec::new(),
             settings,
             settings_store,
             settings_open: false,
@@ -231,19 +311,125 @@ impl Workspace {
     }
 
     fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
+        self.dialog_open = true;
         if self.document.read(cx).document().is_modified() {
             let answer = MessageDialog::new()
-                .set_title("Unsaved changes")
-                .set_description("Discard unsaved changes and open another file? Choose Yes to discard or No to cancel.")
+                .set_title(self.tr("unsaved_title"))
+                .set_description(self.tr("unsaved_open"))
                 .set_buttons(MessageButtons::YesNo)
                 .show();
             if answer != MessageDialogResult::Yes {
+                self.dialog_open = false;
                 return;
             }
         }
-        let Some(path) = FileDialog::new().pick_file() else {
+        let path = FileDialog::new().pick_file();
+        self.dialog_open = false;
+        let Some(path) = path else {
             return;
         };
+        match Document::open(&path) {
+            Ok(document) => {
+                self.document
+                    .update(cx, |view, cx| view.set_document(document, cx));
+                self.status = format!("Opened {}", path.display());
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+        cx.notify();
+    }
+
+    fn open_project_dialog(&mut self, cx: &mut Context<Self>) {
+        self.dialog_open = true;
+        let Some(path) = FileDialog::new().pick_folder() else {
+            self.dialog_open = false;
+            return;
+        };
+        self.dialog_open = false;
+        self.open_project_path(path, cx);
+    }
+
+    pub fn open_project_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match Project::open(&path) {
+            Ok(project) => {
+                self.project = Some(project);
+                self.project_watcher = None;
+                self.project_events = None;
+                if let Some(project) = &self.project {
+                    match project.watch() {
+                        Ok((watcher, receiver)) => {
+                            self.project_watcher = Some(watcher);
+                            self.project_events = Some(receiver);
+                            self.watch_project_events(cx);
+                        }
+                        Err(error) => self.status = error.to_string(),
+                    }
+                }
+                self.status = format!("Project opened: {}", path.display());
+                if self.state.navigation() != Some(NavigationPanel::Project) {
+                    self.state.toggle_navigation(NavigationPanel::Project);
+                }
+            }
+            Err(error) => self.status = error.to_string(),
+        }
+        cx.notify();
+    }
+
+    fn watch_project_events(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let active = this
+                    .update(cx, |this, cx| this.refresh_project_events(cx))
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn refresh_project_events(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        if let Some(receiver) = &self.project_events {
+            while receiver.try_recv().is_ok() {
+                changed = true;
+            }
+        }
+        if changed && !self.dialog_open {
+            if let Some(project) = &mut self.project {
+                project.refresh();
+            }
+            cx.notify();
+        }
+        self.project_events.is_some()
+    }
+
+    fn open_project_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let is_dir = self.project.as_ref().is_some_and(|_| path.is_dir());
+        if is_dir {
+            if let Some(project) = &mut self.project {
+                project.toggle(&path);
+            }
+            cx.notify();
+            return;
+        }
+        self.dialog_open = true;
+        if self.document.read(cx).document().is_modified() {
+            let answer = MessageDialog::new()
+                .set_title(self.tr("unsaved_title"))
+                .set_description(self.tr("unsaved_open"))
+                .set_buttons(MessageButtons::YesNo)
+                .show();
+            if answer != MessageDialogResult::Yes {
+                self.dialog_open = false;
+                return;
+            }
+        }
+        self.dialog_open = false;
         match Document::open(&path) {
             Ok(document) => {
                 self.document
@@ -258,7 +444,10 @@ impl Workspace {
     fn save_document(&mut self, force_dialog: bool, cx: &mut Context<Self>) {
         let has_path = self.document.read(cx).document().path().is_some();
         let path = if force_dialog || !has_path {
-            FileDialog::new().save_file()
+            self.dialog_open = true;
+            let path = FileDialog::new().save_file();
+            self.dialog_open = false;
+            path
         } else {
             self.document
                 .read(cx)
@@ -281,6 +470,9 @@ impl Workspace {
             Ok(()) => format!("Saved {}", path.display()),
             Err(error) => error.to_string(),
         };
+        if let Some(project) = &mut self.project {
+            project.refresh();
+        }
         cx.notify();
     }
 
@@ -290,15 +482,20 @@ impl Workspace {
         }
         self.generation += 1;
         self.streaming = false;
+        self.tool_running = false;
         self.chat.clear();
-        self.status = "New session".into();
+        self.pending_tool = None;
+        self.agent_messages.clear();
+        self.agent_steps = 0;
+        self.audit.clear();
+        self.status = self.tr("new_session").into();
         cx.notify();
     }
 
     fn stop_generation(&mut self, _: &StopGeneration, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
-            self.status = "Cancelling...".into();
+            self.status = self.tr("cancelling").into();
         }
         cx.notify();
     }
@@ -321,6 +518,36 @@ impl Workspace {
         {
             self.status = error.to_string();
         }
+    }
+
+    pub fn tr(&self, key: &'static str) -> &'static str {
+        tr(self.language, key)
+    }
+
+    fn set_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        self.language = language;
+        self.offer_russian = false;
+        self.settings.language = language.code().into();
+        self.settings.locale_offer_dismissed = true;
+        self.document
+            .update(cx, |view, _| view.set_language(language));
+        self.chat_input
+            .update(cx, |input, _| input.set_language(language));
+        self.api_key_input
+            .update(cx, |input, _| input.set_language(language));
+        self.base_url_input
+            .update(cx, |input, _| input.set_language(language));
+        self.model_input
+            .update(cx, |input, _| input.set_language(language));
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn dismiss_language_offer(&mut self, cx: &mut Context<Self>) {
+        self.offer_russian = false;
+        self.settings.locale_offer_dismissed = true;
+        self.persist_settings();
+        cx.notify();
     }
 
     fn send(&mut self, cx: &mut Context<Self>) {
@@ -379,11 +606,13 @@ impl Workspace {
             role: MessageRole::User,
             content: message,
             reasoning: String::new(),
+            show_reasoning: false,
         });
         self.chat.push(ChatEntry {
             role: MessageRole::Assistant,
             content: String::new(),
             reasoning: String::new(),
+            show_reasoning: false,
         });
         self.chat_input.update(cx, |input, cx| input.clear(cx));
         self.generation += 1;
@@ -394,11 +623,14 @@ impl Workspace {
         self.streaming = true;
         self.status = format!("Connecting to {}...", self.settings.provider.kind.label());
         let config = self.settings.provider.clone();
+        self.agent_messages = request_messages.clone();
+        self.current_config = config.clone();
+        let tools = self.project.is_some().then(tool_definitions);
         let client = self.client.clone();
         let worker_sender = sender.clone();
         self.runtime.spawn(async move {
             if let Err(error) = client
-                .stream_chat(&config, &key, &request_messages, cancel, sender)
+                .stream_chat_with_tools(&config, &key, &request_messages, tools, cancel, sender)
                 .await
             {
                 let _ = worker_sender.send(StreamEvent::Error(error.to_string()));
@@ -433,6 +665,29 @@ impl Workspace {
                 entry.content.push_str(&delta);
                 self.status = "Receiving response...".into();
             }
+            StreamEvent::ToolCall(call) => {
+                let diff = self.tool_diff(&call);
+                let action = AgentAction {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                };
+                if self.permission.requires_approval(&action) {
+                    self.pending_tool = Some((call, diff));
+                    self.streaming = false;
+                    self.cancel = None;
+                    self.status = self.tr("approval_required").into();
+                } else {
+                    self.execute_agent_action(call, cx);
+                }
+            }
+            StreamEvent::ToolResult(result) => {
+                self.tool_running = false;
+                self.audit.push(result.clone());
+                if self.audit.len() > 50 {
+                    self.audit.remove(0);
+                }
+                self.start_followup(result, cx);
+            }
             StreamEvent::Usage(usage) => {
                 if let Some(tokens) = usage.get("total_tokens").and_then(|value| value.as_u64()) {
                     self.status = format!("{tokens} tokens");
@@ -440,18 +695,194 @@ impl Workspace {
             }
             StreamEvent::Error(error) => {
                 self.streaming = false;
+                self.tool_running = false;
                 self.cancel = None;
                 self.status = error;
             }
             StreamEvent::Done => {
+                if self.tool_running {
+                    cx.notify();
+                    return;
+                }
                 self.streaming = false;
                 self.cancel = None;
-                if self.status.starts_with("Receiving") || self.status.starts_with("Connecting") {
-                    self.status = "Ready".into();
+                if self.pending_tool.is_some() {
+                    self.status = self.tr("approval_required").into();
+                } else {
+                    if self.status.starts_with("Receiving") || self.status.starts_with("Connecting")
+                    {
+                        self.status = self.tr("ready").into();
+                    }
+                    if let Some(entry) = self.chat.last()
+                        && !entry.content.is_empty()
+                    {
+                        self.agent_messages
+                            .push(ChatMessage::assistant(entry.content.clone()));
+                    }
                 }
             }
         }
         cx.notify();
+    }
+
+    fn tool_diff(&self, call: &ToolCall) -> Option<String> {
+        if call.name != "write_file" {
+            return None;
+        }
+        let root = self.project.as_ref()?.root();
+        let executor = AgentExecutor::new(root).ok()?;
+        let arguments: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+        let path = arguments.get("path")?.as_str()?;
+        let content = arguments.get("content")?.as_str()?;
+        executor.diff(path, content).ok()
+    }
+
+    fn execute_agent_action(&mut self, call: ToolCall, cx: &mut Context<Self>) {
+        let Some(root) = self
+            .project
+            .as_ref()
+            .map(|project| project.root().to_path_buf())
+        else {
+            self.status = self.tr("agent_project_required").into();
+            self.streaming = false;
+            self.cancel = None;
+            return;
+        };
+        let Ok(executor) = AgentExecutor::new(root) else {
+            self.status = self.tr("sandbox_error").into();
+            self.streaming = false;
+            self.cancel = None;
+            return;
+        };
+        if self.agent_steps >= 8 {
+            self.streaming = false;
+            self.cancel = None;
+            self.status = self.tr("agent_step_limit").into();
+            return;
+        }
+        self.agent_steps += 1;
+        let action = AgentAction {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        };
+        self.audit.push(format!("{} {}", call.name, call.arguments));
+        self.status = format!("Running {}...", call.name);
+        self.streaming = true;
+        self.tool_running = true;
+        let generation = self.generation;
+        let cancel = self
+            .cancel
+            .get_or_insert_with(CancellationToken::new)
+            .clone();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let worker_sender = sender.clone();
+        self.runtime.spawn(async move {
+            let result = executor.execute_with_cancel(&action, &cancel).await;
+            let text = match result {
+                Ok(output) => output,
+                Err(error) => format!("Tool error: {error}"),
+            };
+            let _ = worker_sender.send(StreamEvent::ToolResult(text));
+        });
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = receiver.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        this.handle_stream_event(generation, event, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_followup(&mut self, result: String, cx: &mut Context<Self>) {
+        self.pending_tool = None;
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.streaming = false;
+            self.cancel = None;
+            self.status = self.tr("cancelled").into();
+            return;
+        }
+        let key = match CredentialStore::load(&self.current_config.credential_id()) {
+            Ok(Some(key)) => key,
+            _ => {
+                self.streaming = false;
+                self.status = "API key is not available".into();
+                return;
+            }
+        };
+        self.agent_messages.push(ChatMessage::user(format!(
+            "Tool result. Return the final answer to the user or use another tool if needed:\n{result}"
+        )));
+        self.chat.push(ChatEntry {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            reasoning: String::new(),
+            show_reasoning: false,
+        });
+        self.generation += 1;
+        let generation = self.generation;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        self.cancel = Some(cancel.clone());
+        self.streaming = true;
+        self.status = "Waiting for the model...".into();
+        let config = self.current_config.clone();
+        let messages = self.agent_messages.clone();
+        let tools = self.project.is_some().then(tool_definitions);
+        let client = self.client.clone();
+        let worker_sender = sender.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = client
+                .stream_chat_with_tools(&config, &key, &messages, tools, cancel, sender)
+                .await
+            {
+                let _ = worker_sender.send(StreamEvent::Error(error.to_string()));
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = receiver.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        this.handle_stream_event(generation, event, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn approve_pending_tool(&mut self, cx: &mut Context<Self>) {
+        let Some((call, _)) = self.pending_tool.take() else {
+            return;
+        };
+        self.execute_agent_action(call, cx);
+    }
+
+    fn deny_pending_tool(&mut self, cx: &mut Context<Self>) {
+        if self.pending_tool.take().is_some() {
+            self.audit.push("Action denied by user".into());
+            self.start_followup("Action denied by user".into(), cx);
+        }
+    }
+
+    fn permission_label(&self) -> &'static str {
+        match self.permission {
+            PermissionMode::AskEvery => self.tr("ask_all"),
+            PermissionMode::AskImportant => self.tr("ask_important"),
+            PermissionMode::FullAccess => self.tr("full_access"),
+        }
     }
 
     fn select_provider(&mut self, cx: &mut Context<Self>) {
@@ -551,6 +982,90 @@ impl Workspace {
         cx.notify();
     }
 
+    fn window_chrome(
+        &self,
+        _window: &mut Window,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .h(px(34.0))
+            .pl_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(18.0))
+                            .rounded(px(4.0))
+                            .bg(theme.accent)
+                            .text_color(gpui::white())
+                            .text_xs()
+                            .child("A"),
+                    )
+                    .child(div().text_xs().text_color(theme.muted).child("AIRcode")),
+            )
+            .child(
+                div()
+                    .id("window-drag-area")
+                    .flex_1()
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(
+                div()
+                    .id("window-minimize")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(42.0))
+                    .h_full()
+                    .text_color(theme.muted)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                    .on_click(cx.listener(|_, _, window, _| window.minimize_window()))
+                    .child("–"),
+            )
+            .child(
+                div()
+                    .id("window-maximize")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(42.0))
+                    .h_full()
+                    .text_color(theme.muted)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                    .on_click(cx.listener(|_, _, window, _| toggle_maximize(window)))
+                    .child("□"),
+            )
+            .child(
+                div()
+                    .id("window-close")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(42.0))
+                    .h_full()
+                    .text_color(theme.muted)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.red).text_color(gpui::white()))
+                    .on_click(cx.listener(|_, _, window, _| window.remove_window()))
+                    .child("×"),
+            )
+    }
+
     fn header(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -568,7 +1083,7 @@ impl Workspace {
                     .gap_3()
                     .child(logo(theme))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child("AIRcode"))
-                    .child(div().text_xs().text_color(theme.faint).child("0.2.0"))
+                    .child(div().text_xs().text_color(theme.faint).child("0.3.0"))
                     .child(div().w_4())
                     .child(
                         div()
@@ -577,7 +1092,7 @@ impl Workspace {
                             .child(self.document.read(cx).document().file_name().to_string()),
                     )
                     .when(self.document.read(cx).document().is_modified(), |this| {
-                        this.child(div().text_color(theme.yellow).child("modified"))
+                        this.child(div().text_color(theme.yellow).child(self.tr("modified")))
                     }),
             )
             .child(
@@ -601,7 +1116,7 @@ impl Workspace {
                         this.state.toggle_palette();
                         cx.notify();
                     }))
-                    .child("Commands and file actions")
+                    .child(self.tr("commands"))
                     .child(keycap("Ctrl P", theme)),
             )
             .child(
@@ -609,16 +1124,25 @@ impl Workspace {
                     .flex()
                     .gap_2()
                     .child(
-                        action_button("Open", "open-button", false, theme)
+                        action_button(
+                            self.tr("folder"),
+                            "open-folder-button",
+                            self.project.is_some(),
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.open_project_dialog(cx))),
+                    )
+                    .child(
+                        action_button(self.tr("open"), "open-button", false, theme)
                             .on_click(cx.listener(|this, _, _, cx| this.open_file_dialog(cx))),
                     )
                     .child(
-                        action_button("Save", "save-button", false, theme)
+                        action_button(self.tr("save"), "save-button", false, theme)
                             .on_click(cx.listener(|this, _, _, cx| this.save_document(false, cx))),
                     )
                     .child(
                         action_button(
-                            "Theme",
+                            self.tr("theme"),
                             "theme-button",
                             self.state.theme == ThemeMode::Light,
                             theme,
@@ -629,6 +1153,17 @@ impl Workspace {
                         })),
                     )
                     .child(
+                        action_button(self.language.label(), "language-button", false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let language = if this.language == Language::English {
+                                    Language::Russian
+                                } else {
+                                    Language::English
+                                };
+                                this.set_language(language, cx);
+                            })),
+                    )
+                    .child(
                         action_button("AI", "ai-button", self.state.ai_visible(), theme).on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.state.toggle_ai();
@@ -637,18 +1172,28 @@ impl Workspace {
                         ),
                     )
                     .child(
-                        action_button("Settings", "settings-button", self.settings_open, theme)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings_open = !this.settings_open;
-                                cx.notify();
-                            })),
+                        action_button(
+                            self.tr("settings"),
+                            "settings-button",
+                            self.settings_open,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings_open = !this.settings_open;
+                            cx.notify();
+                        })),
                     )
                     .child(
-                        action_button("Focus", "focus-button", self.state.focus_mode, theme)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.toggle_focus_mode();
-                                cx.notify();
-                            })),
+                        action_button(
+                            self.tr("focus"),
+                            "focus-button",
+                            self.state.focus_mode,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.toggle_focus_mode();
+                            cx.notify();
+                        })),
                     ),
             )
     }
@@ -685,59 +1230,155 @@ impl Workspace {
                 ),
             )
             .child(div().flex_1())
-            .child(div().text_xs().text_color(theme.faint).child("0.2"))
+            .child(div().text_xs().text_color(theme.faint).child("0.3"))
     }
 
-    fn navigation_panel(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let document = self.document.read(cx).document();
+    fn resize_handle(
+        &self,
+        target: ResizeTarget,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = match target {
+            ResizeTarget::Left => "resize-left",
+            ResizeTarget::Right => "resize-right",
+        };
+        div()
+            .id(id)
+            .w(px(6.0))
+            .h_full()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .bg(theme.window)
+            .hover(|style| style.bg(theme.accent_soft))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.resizing = Some(target);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                let x: f32 = event.position.x.into();
+                match this.resizing {
+                    Some(ResizeTarget::Left) => {
+                        this.settings.left_width =
+                            (x - this.window_origin_x - 52.0).clamp(160.0, 450.0);
+                    }
+                    Some(ResizeTarget::Right) => {
+                        this.settings.right_width =
+                            (this.window_origin_x + this.window_width - x).clamp(260.0, 650.0);
+                    }
+                    None => return,
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.resizing = None;
+                    this.persist_settings();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.resizing = None;
+                    this.persist_settings();
+                    cx.notify();
+                }),
+            )
+    }
+
+    fn navigation_panel(&mut self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self
+            .project
+            .as_mut()
+            .map(|project| project.visible_rows())
+            .unwrap_or_default();
+        let current_path = self
+            .document
+            .read(cx)
+            .document()
+            .path()
+            .map(|path| path.to_path_buf());
+        let document_name = self.document.read(cx).document().file_name().to_string();
         div()
             .flex()
             .flex_col()
-            .w(px(230.0))
+            .w(px(self.settings.left_width))
             .border_r_1()
             .border_color(theme.border)
             .bg(theme.surface)
-            .child(panel_title("WORKSPACE", "Current document", theme))
-            .child(
-                div()
-                    .m_2()
-                    .p_3()
-                    .rounded_md()
-                    .bg(theme.accent_soft)
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.accent)
-                            .child(document.file_name().to_string()),
-                    )
-                    .child(div().pt_1().text_xs().text_color(theme.muted).child(
-                        if document.is_modified() {
-                            "Unsaved changes"
-                        } else {
-                            "Saved"
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .p_3()
-                    .text_xs()
-                    .line_height(px(18.0))
-                    .text_color(theme.faint)
-                    .child(
-                        document
-                            .path()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "Unsaved document".into()),
+            .child(panel_title(self.tr("project"), self.tr("files"), theme))
+            .when(self.project.is_none(), |this| {
+                this.child(
+                    div().p_3().child(
+                        action_button(self.tr("open_folder"), "sidebar-open-folder", true, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.open_project_dialog(cx))),
                     ),
-            )
-            .child(div().flex_1())
+                )
+            })
             .child(
                 div()
-                    .p_3()
-                    .text_xs()
-                    .text_color(theme.faint)
-                    .child("Large files, Tree-sitter and LSP are planned for the next stage."),
+                    .id("project-tree-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .gap(px(2.0))
+                    .overflow_y_scroll()
+                    .p_2()
+                    .children(rows.into_iter().map(|row| {
+                        let path = row.entry.path.clone();
+                        let active = current_path.as_ref() == Some(&path);
+                        let is_dir = row.entry.is_dir;
+                        let expanded = row.expanded;
+                        let depth = row.depth;
+                        let name = row.entry.name;
+                        div()
+                            .id(gpui::SharedString::from(
+                                path.to_string_lossy().into_owned(),
+                            ))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(27.0))
+                            .pr_2()
+                            .pl(px(6.0 + depth as f32 * 13.0))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_sm()
+                            .when(active, |this| this.bg(theme.accent_soft))
+                            .when(!active, |this| this.hover(|style| style.bg(theme.hover)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_project_entry(path.clone(), cx);
+                            }))
+                            .child(
+                                div()
+                                    .w(px(14.0))
+                                    .text_xs()
+                                    .text_color(if is_dir { theme.accent } else { theme.faint })
+                                    .child(if is_dir {
+                                        if expanded { "v" } else { ">" }
+                                    } else {
+                                        "·"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_color(if active { theme.accent } else { theme.muted })
+                                    .child(name),
+                            )
+                            .into_any_element()
+                    })),
+            )
+            .child(
+                div().m_2().p_3().rounded_md().bg(theme.accent_soft).child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.accent)
+                        .child(document_name),
+                ),
             )
     }
 
@@ -770,9 +1411,7 @@ impl Workspace {
             )
             .child(
                 div()
-                    .id("document-scroll")
                     .flex_1()
-                    .overflow_y_scroll()
                     .py_3()
                     .font_family("monospace")
                     .text_sm()
@@ -784,7 +1423,7 @@ impl Workspace {
         div()
             .flex()
             .flex_col()
-            .w(px(360.0))
+            .w(px(self.settings.right_width))
             .border_l_1()
             .border_color(theme.border)
             .bg(theme.surface)
@@ -817,14 +1456,16 @@ impl Workspace {
                     .gap_4()
                     .p_4()
                     .overflow_y_scroll()
-                    .when(self.chat.is_empty(), |this| this.child(empty_chat(theme)))
-                    .children(
-                        self.chat
-                            .iter()
-                            .cloned()
-                            .map(|entry| chat_message(entry, theme).into_any_element()),
-                    ),
+                    .when(self.chat.is_empty(), |this| {
+                        this.child(empty_chat(theme, self.language))
+                    })
+                    .children(self.chat.iter().cloned().enumerate().map(|(index, entry)| {
+                        chat_message(index, entry, theme, self.language, cx).into_any_element()
+                    })),
             )
+            .when(!self.audit.is_empty(), |this| {
+                this.child(self.audit_panel(theme))
+            })
             .child(
                 div()
                     .flex()
@@ -844,16 +1485,20 @@ impl Workspace {
                             .gap_2()
                             .child(div().text_xs().text_color(theme.faint).child(
                                 if self.settings.include_document {
-                                    "Document context: on"
+                                    self.tr("context_on")
                                 } else {
-                                    "Document context: off"
+                                    self.tr("context_off")
                                 },
                             ))
                             .child(div().flex_1())
                             .child(div().text_xs().text_color(theme.faint).child("Ctrl+Enter"))
                             .child(
                                 action_button(
-                                    if self.streaming { "Stop" } else { "Send" },
+                                    if self.streaming {
+                                        self.tr("stop")
+                                    } else {
+                                        self.tr("send")
+                                    },
                                     "send-button",
                                     true,
                                     theme,
@@ -894,11 +1539,19 @@ impl Workspace {
                     .p_4()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("AI provider settings"))
-                    .child(action_button("Close", "close-settings", false, theme).on_click(cx.listener(|this, _, _, cx| {
-                        this.settings_open = false;
-                        cx.notify();
-                    }))),
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.tr("settings_title")),
+                    )
+                    .child(
+                        action_button(self.tr("close"), "close-settings", false, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.settings_open = false;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -906,43 +1559,236 @@ impl Workspace {
                     .flex_col()
                     .gap_4()
                     .p_4()
-                    .child(setting_row("Provider", provider.kind.label(), theme).on_click(cx.listener(|this, _, _, cx| this.select_provider(cx))))
-                    .when(matches!(provider.kind, ProviderKind::KimiCode | ProviderKind::KimiPlatform), |this| {
-                        this.child(setting_row("Region", match provider.region { Region::China => "China", Region::Overseas => "Overseas" }, theme).on_click(cx.listener(|this, _, _, cx| this.select_region(cx))))
-                    })
-                    .child(div().text_xs().text_color(theme.faint).child(provider.base_url.clone()))
+                    .child(
+                        setting_row(self.tr("provider"), provider.kind.label(), theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.select_provider(cx))),
+                    )
+                    .when(
+                        matches!(
+                            provider.kind,
+                            ProviderKind::KimiCode | ProviderKind::KimiPlatform
+                        ),
+                        |this| {
+                            this.child(
+                                setting_row(
+                                    self.tr("region"),
+                                    match provider.region {
+                                        Region::China => "China",
+                                        Region::Overseas => "Overseas",
+                                    },
+                                    theme,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.select_region(cx))),
+                            )
+                        },
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.faint)
+                            .child(provider.base_url.clone()),
+                    )
                     .when(!provider.model_options().is_empty(), |this| {
-                        this.child(setting_row("Model", provider.model.clone(), theme).on_click(cx.listener(|this, _, _, cx| this.select_model(cx))))
+                        this.child(
+                            setting_row(self.tr("model"), provider.model.clone(), theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.select_model(cx))),
+                        )
                     })
                     .when(provider.model_options().is_empty(), |this| {
-                        this.child(field_label("Model ID", theme)).child(input_container(theme).child(self.model_input.clone()))
+                        this.child(field_label(self.tr("model_id"), theme))
+                            .child(input_container(theme).child(self.model_input.clone()))
                     })
                     .when(provider.kind == ProviderKind::OpenAiCompatible, |this| {
-                        this.child(field_label("Base URL", theme)).child(input_container(theme).child(self.base_url_input.clone()))
+                        this.child(field_label(self.tr("base_url"), theme))
+                            .child(input_container(theme).child(self.base_url_input.clone()))
                     })
                     .when(provider.supports_effort(), |this| {
-                        this.child(setting_row("Reasoning effort (new session)", provider.effort.label(), theme).on_click(cx.listener(|this, _, _, cx| this.select_effort(cx))))
+                        this.child(
+                            setting_row(self.tr("effort"), provider.effort.label(), theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.select_effort(cx))),
+                        )
                     })
                     .when(provider.kind == ProviderKind::KimiCode, |this| {
-                        this.child(div().text_xs().line_height(px(18.0)).text_color(theme.faint).child("K3.1 Pro always uses thinking. Changing the model or effort starts a new session."))
+                        this.child(
+                            div()
+                                .text_xs()
+                                .line_height(px(18.0))
+                                .text_color(theme.faint)
+                                .child(self.tr("kimi_thinking")),
+                        )
                     })
-                    .child(field_label("API key (stored only in the OS credential store)", theme))
+                    .child(field_label(self.tr("api_key_label"), theme))
                     .child(input_container(theme).child(self.api_key_input.clone()))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(action_button("Save key", "save-key", true, theme).on_click(cx.listener(|this, _, _, cx| this.save_api_key(cx))))
-                            .child(action_button("Delete key", "delete-key", false, theme).on_click(cx.listener(|this, _, _, cx| this.delete_api_key(cx))))
-                            .child(div().text_xs().text_color(if self.key_saved { theme.green } else { theme.faint }).child(if self.key_saved { "Key saved" } else { "No key saved" })),
+                            .child(
+                                action_button(self.tr("save_key"), "save-key", true, theme)
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_api_key(cx))),
+                            )
+                            .child(
+                                action_button(self.tr("delete_key"), "delete-key", false, theme)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.delete_api_key(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if self.key_saved {
+                                        theme.green
+                                    } else {
+                                        theme.faint
+                                    })
+                                    .child(if self.key_saved {
+                                        self.tr("key_saved")
+                                    } else {
+                                        self.tr("no_key_saved")
+                                    }),
+                            ),
                     )
-                    .child(setting_row("Include document or selection in chat", if self.settings.include_document { "On" } else { "Off" }, theme).on_click(cx.listener(|this, _, _, cx| {
-                        this.settings.include_document = !this.settings.include_document;
-                        this.persist_settings();
-                        cx.notify();
-                    }))),
+                    .child(
+                        setting_row(self.tr("permission"), self.permission_label(), theme)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.permission = this.permission.next();
+                                this.settings.permission_mode = this.permission.code().into();
+                                this.pending_tool = None;
+                                this.persist_settings();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        setting_row(
+                            self.tr("include_document"),
+                            if self.settings.include_document {
+                                self.tr("on")
+                            } else {
+                                self.tr("off")
+                            },
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings.include_document = !this.settings.include_document;
+                            this.persist_settings();
+                            cx.notify();
+                        })),
+                    ),
             )
+    }
+
+    fn approval_panel(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let (name, arguments, diff) = self
+            .pending_tool
+            .as_ref()
+            .map(|(call, diff)| (call.name.clone(), call.arguments.clone(), diff.clone()))
+            .unwrap_or_default();
+        div()
+            .absolute()
+            .top(px(90.0))
+            .left_0()
+            .right_0()
+            .mx_auto()
+            .w(px(620.0))
+            .rounded_xl()
+            .border_1()
+            .border_color(theme.yellow)
+            .bg(theme.surface)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .p_4()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.tr("approval_required")),
+                    )
+                    .child(badge(
+                        self.permission_label().into(),
+                        theme.accent_soft,
+                        theme.yellow,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .child(div().text_sm().text_color(theme.accent).child(name))
+                    .child(
+                        div()
+                            .text_xs()
+                            .line_height(px(18.0))
+                            .text_color(theme.muted)
+                            .child(arguments),
+                    )
+                    .when_some(diff, |this, diff| {
+                        this.child(
+                            div()
+                                .p_3()
+                                .rounded_md()
+                                .bg(theme.window)
+                                .font_family("monospace")
+                                .text_xs()
+                                .line_height(px(18.0))
+                                .child(diff),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                action_button(self.tr("allow"), "allow-tool", true, theme)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.approve_pending_tool(cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                action_button(self.tr("deny"), "deny-tool", false, theme).on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.deny_pending_tool(cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
+    fn audit_panel(&self, theme: Theme) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .mx_3()
+            .mb_2()
+            .p_3()
+            .rounded_md()
+            .bg(theme.raised)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted)
+                    .child(self.tr("audit")),
+            )
+            .children(self.audit.iter().rev().take(3).rev().cloned().map(|entry| {
+                div()
+                    .text_xs()
+                    .line_height(px(17.0))
+                    .text_color(theme.faint)
+                    .child(entry)
+                    .into_any_element()
+            }))
     }
 
     fn status_bar(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -972,6 +1818,35 @@ impl Workspace {
             .child(self.settings.provider.kind.label())
     }
 
+    fn language_offer(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .top(px(94.0))
+            .left_0()
+            .right_0()
+            .mx_auto()
+            .w(px(520.0))
+            .flex()
+            .items_center()
+            .gap_3()
+            .p_4()
+            .rounded_xl()
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.surface)
+            .shadow_lg()
+            .child(div().flex_1().text_sm().child(self.tr("language_offer")))
+            .child(
+                action_button("Русский", "use-russian", true, theme).on_click(
+                    cx.listener(|this, _, _, cx| this.set_language(Language::Russian, cx)),
+                ),
+            )
+            .child(
+                action_button("Keep English", "keep-english", false, theme)
+                    .on_click(cx.listener(|this, _, _, cx| this.dismiss_language_offer(cx))),
+            )
+    }
+
     fn command_palette(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .absolute()
@@ -994,7 +1869,7 @@ impl Workspace {
                     .text_color(theme.faint)
                     .border_b_1()
                     .border_color(theme.border)
-                    .child("Select a command"),
+                    .child(self.tr("command_palette")),
             )
             .child(
                 div()
@@ -1003,7 +1878,7 @@ impl Workspace {
                     .gap_1()
                     .p_2()
                     .child(command_row(
-                        "File: open",
+                        self.tr("palette_open"),
                         "Ctrl O",
                         PaletteCommand::Open,
                         true,
@@ -1011,7 +1886,7 @@ impl Workspace {
                         cx,
                     ))
                     .child(command_row(
-                        "File: save",
+                        self.tr("palette_save"),
                         "Ctrl S",
                         PaletteCommand::Save,
                         false,
@@ -1019,7 +1894,7 @@ impl Workspace {
                         cx,
                     ))
                     .child(command_row(
-                        "AI: new chat",
+                        self.tr("palette_new_chat"),
                         "Ctrl Shift N",
                         PaletteCommand::NewChat,
                         false,
@@ -1027,7 +1902,7 @@ impl Workspace {
                         cx,
                     ))
                     .child(command_row(
-                        "AI: provider settings",
+                        self.tr("palette_settings"),
                         "Ctrl ,",
                         PaletteCommand::Settings,
                         false,
@@ -1035,7 +1910,7 @@ impl Workspace {
                         cx,
                     ))
                     .child(command_row(
-                        "Focus: toggle",
+                        self.tr("palette_focus"),
                         "Ctrl Shift F",
                         PaletteCommand::Focus,
                         false,
@@ -1043,7 +1918,7 @@ impl Workspace {
                         cx,
                     ))
                     .child(command_row(
-                        "AI: toggle panel",
+                        self.tr("palette_ai"),
                         "Ctrl Shift I",
                         PaletteCommand::Ai,
                         false,
@@ -1051,7 +1926,7 @@ impl Workspace {
                         cx,
                     ))
                     .child(command_row(
-                        "Theme: switch",
+                        self.tr("palette_theme"),
                         "Ctrl Shift T",
                         PaletteCommand::Theme,
                         false,
@@ -1091,8 +1966,10 @@ impl Focusable for Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::from_mode(self.state.theme);
+        self.window_origin_x = window.bounds().origin.x.into();
+        self.window_width = window.bounds().size.width.into();
         div()
             .relative()
             .flex()
@@ -1102,6 +1979,7 @@ impl Render for Workspace {
             .bg(theme.window)
             .text_color(theme.text)
             .track_focus(&self.focus_handle)
+            .child(self.window_chrome(window, theme, cx))
             .child(self.header(theme, cx))
             .child(
                 div()
@@ -1113,18 +1991,26 @@ impl Render for Workspace {
                     })
                     .when(self.state.navigation_visible(), |this| {
                         this.child(self.navigation_panel(theme, cx))
+                            .child(self.resize_handle(ResizeTarget::Left, theme, cx))
                     })
                     .child(self.editor(theme, cx))
                     .when(self.state.ai_visible(), |this| {
-                        this.child(self.assistant_panel(theme, cx))
+                        this.child(self.resize_handle(ResizeTarget::Right, theme, cx))
+                            .child(self.assistant_panel(theme, cx))
                     }),
             )
             .child(self.status_bar(theme, cx))
+            .when(self.offer_russian, |this| {
+                this.child(self.language_offer(theme, cx))
+            })
             .when(self.state.palette_open, |this| {
                 this.child(self.command_palette(theme, cx))
             })
             .when(self.settings_open, |this| {
                 this.child(self.settings_panel(theme, cx))
+            })
+            .when(self.pending_tool.is_some(), |this| {
+                this.child(self.approval_panel(theme, cx))
             })
     }
 }
@@ -1207,7 +2093,7 @@ fn panel_title(title: &'static str, subtitle: &'static str, theme: Theme) -> imp
         .child(div().text_xs().text_color(theme.faint).child(subtitle))
 }
 
-fn empty_chat(theme: Theme) -> impl IntoElement {
+fn empty_chat(theme: Theme, language: Language) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -1215,37 +2101,114 @@ fn empty_chat(theme: Theme) -> impl IntoElement {
         .p_4()
         .rounded_lg()
         .bg(theme.raised)
-        .child(div().font_weight(FontWeight::SEMIBOLD).child("Native AI chat"))
-        .child(div().text_sm().line_height(px(21.0)).text_color(theme.muted).child("Choose Kimi Code and k3.1-pro, save your membership API key, then send a message. Your document is included only when context is enabled."))
-        .child(div().text_xs().line_height(px(18.0)).text_color(theme.faint).child("No CLI, no browser proxy, no keys in settings files."))
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(tr(language, "native_chat")),
+        )
+        .child(
+            div()
+                .text_sm()
+                .line_height(px(21.0))
+                .text_color(theme.muted)
+                .child(tr(language, "chat_hint")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .line_height(px(18.0))
+                .text_color(theme.faint)
+                .child(tr(language, "chat_security")),
+        )
 }
 
-fn chat_message(entry: ChatEntry, theme: Theme) -> impl IntoElement {
+fn chat_message(
+    index: usize,
+    entry: ChatEntry,
+    theme: Theme,
+    language: Language,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     let is_user = entry.role == MessageRole::User;
+    let content = entry.content.clone();
     div()
         .flex()
         .flex_col()
         .gap_2()
         .child(
             div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.muted)
-                .child(if is_user { "You" } else { "AIR" }),
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.muted)
+                        .child(if is_user { tr(language, "you") } else { "AIR" }),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id(gpui::SharedString::from(format!("copy-message-{index}")))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_xs()
+                        .text_color(theme.muted)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(content.clone()));
+                        }))
+                        .child(tr(language, "copy")),
+                )
+                .when(!entry.reasoning.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .id(gpui::SharedString::from(format!(
+                                "toggle-reasoning-{index}"
+                            )))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(theme.purple)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.chat[index].show_reasoning = !this.chat[index].show_reasoning;
+                                cx.notify();
+                            }))
+                            .child(if entry.show_reasoning {
+                                tr(language, "hide_reasoning")
+                            } else {
+                                tr(language, "show_reasoning")
+                            }),
+                    )
+                }),
         )
-        .when(!entry.reasoning.is_empty(), |this| {
-            this.child(
-                div()
-                    .p_3()
-                    .rounded_md()
-                    .bg(theme.window)
-                    .text_xs()
-                    .line_height(px(18.0))
-                    .text_color(theme.faint)
-                    .child(div().pb_1().text_color(theme.purple).child("Reasoning"))
-                    .child(entry.reasoning),
-            )
-        })
+        .when(
+            entry.show_reasoning && !entry.reasoning.is_empty(),
+            |this| {
+                this.child(
+                    div()
+                        .p_3()
+                        .rounded_md()
+                        .bg(theme.window)
+                        .text_xs()
+                        .line_height(px(18.0))
+                        .text_color(theme.faint)
+                        .child(
+                            div()
+                                .pb_1()
+                                .text_color(theme.purple)
+                                .child(tr(language, "reasoning")),
+                        )
+                        .child(entry.reasoning),
+                )
+            },
+        )
         .child(
             div()
                 .p_3()
@@ -1256,7 +2219,7 @@ fn chat_message(entry: ChatEntry, theme: Theme) -> impl IntoElement {
                 .line_height(px(21.0))
                 .text_color(theme.text)
                 .child(if entry.content.is_empty() {
-                    "Thinking...".into()
+                    tr(language, "thinking").into()
                 } else {
                     entry.content
                 }),

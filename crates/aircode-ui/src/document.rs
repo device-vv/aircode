@@ -1,12 +1,14 @@
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 use aircode_editor::Document;
+use aircode_i18n::{Language as UiLanguage, tr};
+use aircode_syntax::{HighlightKind, Language, SyntaxHighlighter};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point,
-    prelude::*, px, relative, rgba, size,
+    ScrollHandle, ShapedLine, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, relative, rgba, size,
 };
 
 actions!(
@@ -60,24 +62,32 @@ pub fn register_actions(cx: &mut App) {
 
 pub struct DocumentView {
     document: Document,
+    language: UiLanguage,
     focus_handle: FocusHandle,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    last_layouts: Vec<ShapedLine>,
+    last_layouts: HashMap<usize, ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    context_menu_open: bool,
+    syntax: Option<SyntaxHighlighter>,
+    scroll_handle: ScrollHandle,
 }
 
 impl DocumentView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             document: Document::from_text("// Open a file or start typing here.\n"),
+            language: UiLanguage::English,
             focus_handle: cx.focus_handle(),
             selection_reversed: false,
             marked_range: None,
-            last_layouts: Vec::new(),
+            last_layouts: HashMap::new(),
             last_bounds: None,
             is_selecting: false,
+            context_menu_open: false,
+            syntax: None,
+            scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -90,6 +100,13 @@ impl DocumentView {
     }
 
     pub fn set_document(&mut self, document: Document, cx: &mut Context<Self>) {
+        self.syntax = document
+            .path()
+            .and_then(Language::from_path)
+            .and_then(|language| SyntaxHighlighter::new(language).ok());
+        if let Some(syntax) = &mut self.syntax {
+            syntax.set_text(document.text());
+        }
         self.document = document;
         self.marked_range = None;
         self.last_layouts.clear();
@@ -229,11 +246,19 @@ impl DocumentView {
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         self.document.undo();
+        if let Some(syntax) = &mut self.syntax {
+            syntax.set_text(self.document.text());
+        }
+        self.last_layouts.clear();
         cx.notify();
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
         self.document.redo();
+        if let Some(syntax) = &mut self.syntax {
+            syntax.set_text(self.document.text());
+        }
+        self.last_layouts.clear();
         cx.notify();
     }
 
@@ -261,6 +286,7 @@ impl DocumentView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle(cx));
+        self.context_menu_open = false;
         self.is_selecting = true;
         let offset = self.index_for_mouse_position(event.position);
         if event.modifiers.shift {
@@ -280,14 +306,97 @@ impl DocumentView {
         }
     }
 
+    fn on_right_mouse_down(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle(cx));
+        self.context_menu_open = true;
+        cx.notify();
+    }
+
+    fn context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("document-context-menu")
+            .absolute()
+            .top(px(24.0))
+            .left(px(60.0))
+            .w(px(150.0))
+            .flex()
+            .flex_col()
+            .rounded_md()
+            .border_1()
+            .border_color(gpui::rgba(0x7c8cff60))
+            .bg(gpui::rgba(0x1a1e26f0))
+            .shadow_lg()
+            .child(
+                div()
+                    .id("document-context-cut")
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x7c8cff30)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.cut(&Cut, window, cx);
+                        this.context_menu_open = false;
+                    }))
+                    .child(tr(self.language, "cut")),
+            )
+            .child(
+                div()
+                    .id("document-context-copy")
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x7c8cff30)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.copy(&Copy, window, cx);
+                        this.context_menu_open = false;
+                    }))
+                    .child(tr(self.language, "copy")),
+            )
+            .child(
+                div()
+                    .id("document-context-paste")
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x7c8cff30)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.paste(&Paste, window, cx);
+                        this.context_menu_open = false;
+                    }))
+                    .child(tr(self.language, "paste")),
+            )
+            .child(
+                div()
+                    .id("document-context-select-all")
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x7c8cff30)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.select_all(&SelectAll, window, cx);
+                        this.context_menu_open = false;
+                    }))
+                    .child(tr(self.language, "select_all")),
+            )
+    }
+
+    pub fn set_language(&mut self, language: UiLanguage) {
+        self.language = language;
+    }
+
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
         let Some(bounds) = self.last_bounds else {
             return 0;
         };
         let line_height = px(22.0);
         let line = ((position.y - bounds.top()) / line_height).floor().max(0.0) as usize;
-        let line = line.min(self.last_layouts.len().saturating_sub(1));
-        let Some(layout) = self.last_layouts.get(line) else {
+        let line = line.min(self.line_ranges().len().saturating_sub(1));
+        let Some(layout) = self.last_layouts.get(&line) else {
             return 0;
         };
         let line_start = self.line_ranges()[line].start;
@@ -414,7 +523,11 @@ impl EntityInputHandler for DocumentView {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.document.selection());
-        if self.document.replace_range(range, new_text).is_ok() {
+        let old_text = self.document.text().to_string();
+        if self.document.replace_range(range.clone(), new_text).is_ok() {
+            if let Some(syntax) = &mut self.syntax {
+                syntax.replace_range(&old_text, self.document.text(), range, new_text);
+            }
             self.selection_reversed = false;
             self.marked_range = None;
             self.last_layouts.clear();
@@ -459,8 +572,8 @@ impl EntityInputHandler for DocumentView {
         let range = self.range_from_utf16(&range_utf16);
         let (start_line, start_column) = self.line_column(range.start);
         let (end_line, end_column) = self.line_column(range.end);
-        let start_layout = self.last_layouts.get(start_line)?;
-        let end_layout = self.last_layouts.get(end_line)?;
+        let start_layout = self.last_layouts.get(&start_line)?;
+        let end_layout = self.last_layouts.get(&end_line)?;
         Some(Bounds::from_corners(
             point(
                 bounds.left() + px(54.0) + start_layout.x_for_index(start_column),
@@ -488,8 +601,8 @@ struct DocumentElement {
 }
 
 struct PrepaintState {
-    lines: Vec<ShapedLine>,
-    numbers: Vec<ShapedLine>,
+    lines: Vec<(usize, ShapedLine)>,
+    numbers: Vec<(usize, ShapedLine)>,
     selection: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
 }
@@ -544,12 +657,19 @@ impl Element for DocumentElement {
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_ranges = input.line_ranges();
+        let scroll_offset = -input.scroll_handle.offset().y;
+        let first = (scroll_offset / px(22.0)).floor().max(0.0) as usize;
+        let visible = (input.scroll_handle.bounds().size.height / px(22.0))
+            .ceil()
+            .max(1.0) as usize
+            + 2;
+        let last = (first + visible).min(line_ranges.len());
         let mut lines = Vec::new();
         let mut numbers = Vec::new();
         let mut selection_quads = Vec::new();
         let mut cursor_quad = None;
 
-        for (line_index, range) in line_ranges.iter().enumerate() {
+        for (line_index, range) in line_ranges.iter().enumerate().take(last).skip(first) {
             let line_text = &text[range.clone()];
             let run = TextRun {
                 len: line_text.len(),
@@ -588,7 +708,7 @@ impl Element for DocumentElement {
                 .filter(|run| run.len > 0)
                 .collect()
             } else {
-                vec![run]
+                highlight_runs(input, range, run)
             };
             let line = window.text_system().shape_line(
                 line_text.to_owned().into(),
@@ -639,8 +759,8 @@ impl Element for DocumentElement {
                     style.color,
                 ));
             }
-            lines.push(line);
-            numbers.push(number);
+            lines.push((line_index, line));
+            numbers.push((line_index, number));
         }
         PrepaintState {
             lines,
@@ -669,21 +789,17 @@ impl Element for DocumentElement {
         for selection in prepaint.selection.drain(..) {
             window.paint_quad(selection);
         }
-        for (index, line) in prepaint.lines.drain(..).enumerate() {
+        for (index, line) in prepaint.lines.drain(..) {
             let origin = point(
                 bounds.left() + px(54.0),
                 bounds.top() + px(22.0 * index as f32),
             );
             line.paint(origin, px(22.0), window, cx).unwrap();
             self.input.update(cx, |input, _| {
-                if input.last_layouts.len() <= index {
-                    input.last_layouts.push(line.clone());
-                } else {
-                    input.last_layouts[index] = line.clone();
-                }
+                input.last_layouts.insert(index, line.clone());
             });
         }
-        for (index, number) in prepaint.numbers.drain(..).enumerate() {
+        for (index, number) in prepaint.numbers.drain(..) {
             number
                 .paint(
                     point(bounds.left(), bounds.top() + px(22.0 * index as f32)),
@@ -704,11 +820,64 @@ impl Element for DocumentElement {
     }
 }
 
+fn highlight_runs(input: &DocumentView, line_range: &Range<usize>, base: TextRun) -> Vec<TextRun> {
+    let Some(syntax) = &input.syntax else {
+        return vec![base];
+    };
+    let mut runs = Vec::new();
+    let mut cursor = 0usize;
+    for span in syntax.spans() {
+        if span.range.end <= line_range.start || span.range.start >= line_range.end {
+            continue;
+        }
+        let start = span.range.start.max(line_range.start) - line_range.start;
+        let end = span.range.end.min(line_range.end) - line_range.start;
+        if start < cursor || end <= start {
+            continue;
+        }
+        if start > cursor {
+            runs.push(TextRun {
+                len: start - cursor,
+                ..base.clone()
+            });
+        }
+        runs.push(TextRun {
+            len: end - start,
+            color: highlight_color(span.kind),
+            ..base.clone()
+        });
+        cursor = end;
+    }
+    if cursor < line_range.len() {
+        runs.push(TextRun {
+            len: line_range.len() - cursor,
+            ..base.clone()
+        });
+    }
+    if runs.is_empty() { vec![base] } else { runs }
+}
+
+fn highlight_color(kind: HighlightKind) -> gpui::Hsla {
+    match kind {
+        HighlightKind::Keyword => gpui::rgb(0xc678dd).into(),
+        HighlightKind::String => gpui::rgb(0x78c6a3).into(),
+        HighlightKind::Comment => gpui::rgb(0x596275).into(),
+        HighlightKind::Number => gpui::rgb(0xe5c07b).into(),
+        HighlightKind::Function => gpui::rgb(0x61afef).into(),
+        HighlightKind::Type => gpui::rgb(0xe5c07b).into(),
+        HighlightKind::Macro => gpui::rgb(0xe06c75).into(),
+    }
+}
+
 impl Render for DocumentView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .relative()
+            .id("document-editor-scroll")
             .key_context("Document")
             .track_focus(&self.focus_handle(cx))
+            .track_scroll(&self.scroll_handle)
+            .overflow_y_scroll()
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -730,10 +899,14 @@ impl Render for DocumentView {
             .on_action(cx.listener(Self::tab))
             .on_action(cx.listener(Self::show_character_palette))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(DocumentElement { input: cx.entity() })
+            .when(self.context_menu_open, |this| {
+                this.child(self.context_menu(cx))
+            })
     }
 }
 

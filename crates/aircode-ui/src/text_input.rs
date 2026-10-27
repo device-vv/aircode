@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use aircode_i18n::{Language as UiLanguage, tr};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
@@ -47,6 +48,7 @@ pub fn register_actions(cx: &mut App) {
 }
 
 pub struct TextInput {
+    language: UiLanguage,
     focus_handle: FocusHandle,
     content: SharedString,
     placeholder: SharedString,
@@ -55,13 +57,16 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    last_scroll_x: Pixels,
     is_selecting: bool,
     masked: bool,
+    context_menu_open: bool,
 }
 
 impl TextInput {
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self {
+            language: UiLanguage::English,
             focus_handle: cx.focus_handle(),
             content: "".into(),
             placeholder: placeholder.into(),
@@ -70,8 +75,10 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            last_scroll_x: px(0.0),
             is_selecting: false,
             masked: false,
+            context_menu_open: false,
         }
     }
 
@@ -155,6 +162,7 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle(cx));
+        self.context_menu_open = false;
         self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -171,6 +179,89 @@ impl TextInput {
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
+    }
+
+    fn on_right_mouse_down(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle(cx));
+        self.context_menu_open = true;
+        cx.notify();
+    }
+
+    fn context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("text-input-context-menu")
+            .absolute()
+            .top(px(24.0))
+            .left_0()
+            .w(px(150.0))
+            .flex()
+            .flex_col()
+            .rounded_md()
+            .border_1()
+            .border_color(gpui::rgba(0x7c8cff60))
+            .bg(gpui::rgba(0x1a1e26f0))
+            .shadow_lg()
+            .child(
+                div()
+                    .id("context-cut")
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x7c8cff30)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.cut(&Cut, window, cx);
+                        this.context_menu_open = false;
+                    }))
+                    .child(tr(self.language, "cut")),
+            )
+            .child(
+                div()
+                    .id("context-copy")
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x7c8cff30)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.copy(&Copy, window, cx);
+                        this.context_menu_open = false;
+                    }))
+                    .child(tr(self.language, "copy")),
+            )
+            .child(
+                div()
+                    .id("context-paste")
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x7c8cff30)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.paste(&Paste, window, cx);
+                        this.context_menu_open = false;
+                    }))
+                    .child(tr(self.language, "paste")),
+            )
+            .child(
+                div()
+                    .id("context-select-all")
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x7c8cff30)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.select_all(&SelectAll, window, cx);
+                        this.context_menu_open = false;
+                    }))
+                    .child(tr(self.language, "select_all")),
+            )
+    }
+
+    pub fn set_language(&mut self, language: UiLanguage) {
+        self.language = language;
     }
 
     fn show_character_palette(
@@ -234,7 +325,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.last_scroll_x)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -387,8 +478,14 @@ impl EntityInputHandler for TextInput {
         let line = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
-            point(bounds.left() + line.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + line.x_for_index(range.end), bounds.bottom()),
+            point(
+                bounds.left() + line.x_for_index(range.start) - self.last_scroll_x,
+                bounds.top(),
+            ),
+            point(
+                bounds.left() + line.x_for_index(range.end) - self.last_scroll_x,
+                bounds.bottom(),
+            ),
         ))
     }
 
@@ -400,7 +497,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let bounds = self.last_bounds?.localize(&position)?;
         let line = self.last_layout.as_ref()?;
-        let utf8_index = line.index_for_x(position.x - bounds.x)?;
+        let utf8_index = line.index_for_x(position.x - bounds.x + self.last_scroll_x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -413,6 +510,7 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    scroll_x: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -513,12 +611,17 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
         let cursor_pos = line.x_for_index(cursor);
+        let scroll_x = if selected_range.is_empty() {
+            (cursor_pos - bounds.size.width + px(12.0)).max(px(0.0))
+        } else {
+            (line.x_for_index(selected_range.end) - bounds.size.width + px(12.0)).max(px(0.0))
+        };
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_pos, bounds.top()),
+                        point(bounds.left() + cursor_pos - scroll_x, bounds.top()),
                         size(px(2.0), bounds.size.height),
                     ),
                     style.color,
@@ -529,11 +632,11 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.left() + line.x_for_index(selected_range.start) - scroll_x,
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.left() + line.x_for_index(selected_range.end) - scroll_x,
                             bounds.bottom(),
                         ),
                     ),
@@ -546,6 +649,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor,
             selection,
+            scroll_x,
         }
     }
 
@@ -569,8 +673,13 @@ impl Element for TextElement {
             window.paint_quad(selection);
         }
         let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .unwrap();
+        line.paint(
+            point(bounds.left() - prepaint.scroll_x, bounds.top()),
+            window.line_height(),
+            window,
+            cx,
+        )
+        .unwrap();
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
         {
@@ -579,6 +688,7 @@ impl Element for TextElement {
         self.input.update(cx, |input, _| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.last_scroll_x = prepaint.scroll_x;
         });
     }
 }
@@ -586,8 +696,10 @@ impl Element for TextElement {
 impl Render for TextInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .relative()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
+            .overflow_hidden()
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -603,10 +715,14 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(TextElement { input: cx.entity() })
+            .when(self.context_menu_open, |this| {
+                this.child(self.context_menu(cx))
+            })
     }
 }
 
