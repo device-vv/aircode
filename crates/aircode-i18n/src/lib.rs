@@ -100,11 +100,13 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::English, "use_russian") => "Русский",
         (Language::English, "unsaved_title") => "Unsaved changes",
         (Language::English, "unsaved_open") => {
-            "Discard unsaved changes and open another file? Choose Yes to discard or No to cancel."
+            "Open another file and discard unsaved changes in the current document?"
         }
         (Language::English, "unsaved_close") => {
-            "Close AIRcode and discard unsaved changes? Choose Yes to close or No to keep editing."
+            "Close AIRcode and discard unsaved changes in the current document?"
         }
+        (Language::English, "discard") => "Discard changes",
+        (Language::English, "keep_editing") => "Keep editing",
         (Language::English, "permission") => "Agent permissions",
         (Language::English, "ask_all") => "Ask every action",
         (Language::English, "ask_important") => "Ask important only",
@@ -189,11 +191,13 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::Russian, "language") => "Язык",
         (Language::Russian, "unsaved_title") => "Несохранённые изменения",
         (Language::Russian, "unsaved_open") => {
-            "Отменить несохранённые изменения и открыть другой файл? «Да» — отменить, «Нет» — остаться."
+            "Открыть другой файл и отменить несохранённые изменения в текущем документе?"
         }
         (Language::Russian, "unsaved_close") => {
-            "Закрыть AIRcode без сохранения? «Да» — закрыть, «Нет» — продолжить редактирование."
+            "Закрыть AIRcode и отменить несохранённые изменения в текущем документе?"
         }
+        (Language::Russian, "discard") => "Отменить изменения",
+        (Language::Russian, "keep_editing") => "Продолжить редактирование",
         (Language::Russian, "permission") => "Разрешения агента",
         (Language::Russian, "ask_all") => "Спрашивать каждое действие",
         (Language::Russian, "ask_important") => "Спрашивать только важное",

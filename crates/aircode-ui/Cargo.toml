@@ -15,7 +15,6 @@ aircode-project.workspace = true
 aircode-syntax.workspace = true
 gpui.workspace = true
 raw-window-handle = "0.6.2"
-rfd = "0.17.2"
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

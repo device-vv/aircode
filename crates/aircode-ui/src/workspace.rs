@@ -14,9 +14,9 @@ use aircode_i18n::{Language, system_is_russian, tr};
 use aircode_project::{Project, RecommendedWatcher};
 use gpui::{
     App, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight,
-    KeyBinding, MouseButton, Rgba, Window, WindowControlArea, actions, div, prelude::*, px,
+    KeyBinding, MouseButton, PathPromptOptions, Rgba, Window, WindowControlArea, actions, div,
+    prelude::*, px,
 };
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult};
 use tokio::{runtime::Runtime, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -102,6 +102,8 @@ pub fn register_global_actions(workspace: Entity<Workspace>, cx: &mut App) {
         view.update(cx, |this, cx| {
             this.state.close_palette();
             this.settings_open = false;
+            this.pending_discard = None;
+            this.close_confirmation_open = false;
             cx.notify();
         });
     });
@@ -159,23 +161,66 @@ enum ResizeTarget {
     Right,
 }
 
+enum PendingDiscard {
+    OpenDialog,
+    OpenPath(PathBuf),
+}
+
+#[cfg(windows)]
+fn start_window_drag(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    unsafe extern "system" {
+        fn ReleaseCapture() -> i32;
+        fn SendMessageW(
+            window: *mut std::ffi::c_void,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize;
+    }
+
+    if let Ok(handle) = HasWindowHandle::window_handle(window)
+        && let RawWindowHandle::Win32(handle) = handle.as_raw()
+    {
+        unsafe {
+            ReleaseCapture();
+            SendMessageW(handle.hwnd.get() as *mut std::ffi::c_void, 0x00a1, 2, 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn start_window_drag(_: &Window) {}
+
 #[cfg(windows)]
 fn toggle_maximize(window: &Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     unsafe extern "system" {
-        fn ShowWindow(window: *mut std::ffi::c_void, command: i32) -> i32;
+        fn PostMessageW(
+            window: *mut std::ffi::c_void,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> i32;
     }
 
-    if !window.is_maximized() {
-        window.zoom_window();
-        return;
-    }
     if let Ok(handle) = HasWindowHandle::window_handle(window)
         && let RawWindowHandle::Win32(handle) = handle.as_raw()
     {
+        let command = if window.is_maximized() {
+            0xf120
+        } else {
+            0xf030
+        };
         unsafe {
-            ShowWindow(handle.hwnd.get() as *mut std::ffi::c_void, 9);
+            PostMessageW(
+                handle.hwnd.get() as *mut std::ffi::c_void,
+                0x0112,
+                command,
+                0,
+            );
         }
     }
 }
@@ -190,11 +235,15 @@ pub struct Workspace {
     language: Language,
     offer_russian: bool,
     dialog_open: bool,
+    pending_discard: Option<PendingDiscard>,
+    close_confirmation_open: bool,
+    close_confirmed: bool,
     focus_handle: FocusHandle,
     resizing: Option<ResizeTarget>,
     window_origin_x: f32,
     window_width: f32,
     document: Entity<DocumentView>,
+    document_generation: u64,
     project: Option<Project>,
     project_watcher: Option<RecommendedWatcher>,
     project_events: Option<std_mpsc::Receiver<()>>,
@@ -277,11 +326,15 @@ impl Workspace {
             language,
             offer_russian,
             dialog_open: false,
+            pending_discard: None,
+            close_confirmation_open: false,
+            close_confirmed: false,
             focus_handle: cx.focus_handle(),
             resizing: None,
             window_origin_x: 0.0,
             window_width: 1440.0,
             document,
+            document_generation: 0,
             project: None,
             project_watcher: None,
             project_events: None,
@@ -311,42 +364,104 @@ impl Workspace {
     }
 
     fn open_file_dialog(&mut self, cx: &mut Context<Self>) {
-        self.dialog_open = true;
-        if self.document.read(cx).document().is_modified() {
-            let answer = MessageDialog::new()
-                .set_title(self.tr("unsaved_title"))
-                .set_description(self.tr("unsaved_open"))
-                .set_buttons(MessageButtons::YesNo)
-                .show();
-            if answer != MessageDialogResult::Yes {
-                self.dialog_open = false;
-                return;
-            }
-        }
-        let path = FileDialog::new().pick_file();
-        self.dialog_open = false;
-        let Some(path) = path else {
+        if self.dialog_open {
             return;
-        };
-        match Document::open(&path) {
-            Ok(document) => {
-                self.document
-                    .update(cx, |view, cx| view.set_document(document, cx));
-                self.status = format!("Opened {}", path.display());
-            }
-            Err(error) => self.status = error.to_string(),
         }
+        if self.document.read(cx).document().is_modified() {
+            self.pending_discard = Some(PendingDiscard::OpenDialog);
+            cx.notify();
+            return;
+        }
+        self.show_open_file_dialog(cx);
+    }
+
+    fn show_open_file_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.dialog_open {
+            return;
+        }
+        self.dialog_open = true;
         cx.notify();
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.tr("open").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver.await;
+            let _ = this.update(cx, |this, cx| {
+                this.dialog_open = false;
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            this.open_document_path(path, cx);
+                        }
+                    }
+                    Ok(Err(error)) => this.status = error.to_string(),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_document_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.document_generation += 1;
+        let generation = self.document_generation;
+        let display_path = path.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { Document::open(&path) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if generation != this.document_generation {
+                    return;
+                }
+                match result {
+                    Ok(document) => {
+                        this.document
+                            .update(cx, |view, cx| view.set_document(document, cx));
+                        this.status = format!("Opened {}", display_path.display());
+                    }
+                    Err(error) => this.status = error.to_string(),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_project_dialog(&mut self, cx: &mut Context<Self>) {
-        self.dialog_open = true;
-        let Some(path) = FileDialog::new().pick_folder() else {
-            self.dialog_open = false;
+        if self.dialog_open {
             return;
-        };
-        self.dialog_open = false;
-        self.open_project_path(path, cx);
+        }
+        self.dialog_open = true;
+        cx.notify();
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.tr("open_folder").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver.await;
+            let _ = this.update(cx, |this, cx| {
+                this.dialog_open = false;
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            this.open_project_path(path, cx);
+                        }
+                    }
+                    Ok(Err(error)) => this.status = error.to_string(),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn open_project_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -409,58 +524,67 @@ impl Workspace {
     }
 
     fn open_project_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let is_dir = self.project.as_ref().is_some_and(|_| path.is_dir());
-        if is_dir {
+        if path.is_dir() {
             if let Some(project) = &mut self.project {
                 project.toggle(&path);
             }
             cx.notify();
             return;
         }
-        self.dialog_open = true;
         if self.document.read(cx).document().is_modified() {
-            let answer = MessageDialog::new()
-                .set_title(self.tr("unsaved_title"))
-                .set_description(self.tr("unsaved_open"))
-                .set_buttons(MessageButtons::YesNo)
-                .show();
-            if answer != MessageDialogResult::Yes {
-                self.dialog_open = false;
-                return;
-            }
+            self.pending_discard = Some(PendingDiscard::OpenPath(path));
+            cx.notify();
+            return;
         }
-        self.dialog_open = false;
-        match Document::open(&path) {
-            Ok(document) => {
-                self.document
-                    .update(cx, |view, cx| view.set_document(document, cx));
-                self.status = format!("Opened {}", path.display());
-            }
-            Err(error) => self.status = error.to_string(),
-        }
-        cx.notify();
+        self.open_document_path(path, cx);
     }
 
     fn save_document(&mut self, force_dialog: bool, cx: &mut Context<Self>) {
-        let has_path = self.document.read(cx).document().path().is_some();
-        let path = if force_dialog || !has_path {
-            self.dialog_open = true;
-            let path = FileDialog::new().save_file();
-            self.dialog_open = false;
-            path
-        } else {
-            self.document
-                .read(cx)
-                .document()
-                .path()
+        let document = self.document.read(cx).document();
+        let path = document.path().map(|path| path.to_path_buf());
+        if force_dialog || path.is_none() {
+            if self.dialog_open {
+                return;
+            }
+            let directory = path
+                .as_deref()
+                .and_then(|path| path.parent())
                 .map(|path| path.to_path_buf())
-        };
-        let Some(path) = path else {
+                .or_else(|| {
+                    self.project
+                        .as_ref()
+                        .map(|project| project.root().to_path_buf())
+                })
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let file_name = document.file_name().to_string();
+            self.dialog_open = true;
+            cx.notify();
+            let receiver = cx.prompt_for_new_path(&directory, Some(&file_name));
+            cx.spawn(async move |this, cx| {
+                let result = receiver.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.dialog_open = false;
+                    match result {
+                        Ok(Ok(Some(path))) => this.save_document_to(path, true, cx),
+                        Ok(Err(error)) => this.status = error.to_string(),
+                        _ => {}
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
             return;
-        };
+        }
+        if let Some(path) = path {
+            self.save_document_to(path, false, cx);
+        }
+    }
+
+    fn save_document_to(&mut self, path: PathBuf, save_as: bool, cx: &mut Context<Self>) {
         let result = self.document.update(cx, |view, _| {
             let document = view.document_mut();
-            if force_dialog || !has_path {
+            if save_as {
                 document.save_as(&path)
             } else {
                 document.save()
@@ -472,6 +596,43 @@ impl Workspace {
         };
         if let Some(project) = &mut self.project {
             project.refresh();
+        }
+        cx.notify();
+    }
+
+    pub fn should_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.close_confirmed || !self.document.read(cx).document().is_modified() {
+            return true;
+        }
+        self.close_confirmation_open = true;
+        cx.notify();
+        false
+    }
+
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.should_close(cx) {
+            window.remove_window();
+        }
+    }
+
+    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_confirmation_open = false;
+        self.close_confirmed = true;
+        window.remove_window();
+        cx.notify();
+    }
+
+    fn cancel_unsaved_action(&mut self, cx: &mut Context<Self>) {
+        self.pending_discard = None;
+        self.close_confirmation_open = false;
+        cx.notify();
+    }
+
+    fn confirm_discard(&mut self, cx: &mut Context<Self>) {
+        match self.pending_discard.take() {
+            Some(PendingDiscard::OpenDialog) => self.show_open_file_dialog(cx),
+            Some(PendingDiscard::OpenPath(path)) => self.open_document_path(path, cx),
+            None => {}
         }
         cx.notify();
     }
@@ -991,16 +1152,28 @@ impl Workspace {
         div()
             .flex()
             .items_center()
+            .w_full()
             .h(px(34.0))
-            .pl_3()
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.surface)
             .child(
                 div()
+                    .id("window-drag-area")
                     .flex()
+                    .flex_1()
                     .items_center()
                     .gap_2()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .pl_3()
+                    .when(!cfg!(windows), |this| {
+                        this.window_control_area(WindowControlArea::Drag)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, window, _| start_window_drag(window)),
+                    )
                     .child(
                         div()
                             .flex()
@@ -1017,15 +1190,9 @@ impl Workspace {
             )
             .child(
                 div()
-                    .id("window-drag-area")
-                    .flex_1()
-                    .h_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            .child(
-                div()
                     .id("window-minimize")
                     .flex()
+                    .flex_none()
                     .items_center()
                     .justify_center()
                     .w(px(42.0))
@@ -1033,13 +1200,17 @@ impl Workspace {
                     .text_color(theme.muted)
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.hover).text_color(theme.text))
-                    .on_click(cx.listener(|_, _, window, _| window.minimize_window()))
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        window.minimize_window();
+                        cx.notify();
+                    }))
                     .child("–"),
             )
             .child(
                 div()
                     .id("window-maximize")
                     .flex()
+                    .flex_none()
                     .items_center()
                     .justify_center()
                     .w(px(42.0))
@@ -1047,13 +1218,18 @@ impl Workspace {
                     .text_color(theme.muted)
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.hover).text_color(theme.text))
-                    .on_click(cx.listener(|_, _, window, _| toggle_maximize(window)))
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        toggle_maximize(window);
+                        window.refresh();
+                        cx.notify();
+                    }))
                     .child("□"),
             )
             .child(
                 div()
                     .id("window-close")
                     .flex()
+                    .flex_none()
                     .items_center()
                     .justify_center()
                     .w(px(42.0))
@@ -1061,7 +1237,7 @@ impl Workspace {
                     .text_color(theme.muted)
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.red).text_color(gpui::white()))
-                    .on_click(cx.listener(|_, _, window, _| window.remove_window()))
+                    .on_click(cx.listener(|this, _, window, cx| this.request_close(window, cx)))
                     .child("×"),
             )
     }
@@ -1847,6 +2023,68 @@ impl Workspace {
             )
     }
 
+    fn unsaved_panel(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let closing = self.close_confirmation_open;
+        div()
+            .absolute()
+            .top(px(94.0))
+            .left_0()
+            .right_0()
+            .mx_auto()
+            .w(px(520.0))
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_4()
+            .rounded_xl()
+            .border_1()
+            .border_color(theme.yellow)
+            .bg(theme.surface)
+            .shadow_lg()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(self.tr("unsaved_title")),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .line_height(px(21.0))
+                    .text_color(theme.muted)
+                    .child(if closing {
+                        self.tr("unsaved_close")
+                    } else {
+                        self.tr("unsaved_open")
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        action_button(self.tr("keep_editing"), "keep-editing", false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_unsaved_action(cx);
+                            })),
+                    )
+                    .when(closing, |this| {
+                        this.child(
+                            action_button(self.tr("discard"), "confirm-close", true, theme)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_close(window, cx);
+                                })),
+                        )
+                    })
+                    .when(!closing, |this| {
+                        this.child(
+                            action_button(self.tr("discard"), "confirm-discard", true, theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.confirm_discard(cx))),
+                        )
+                    }),
+            )
+    }
+
     fn command_palette(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .absolute()
@@ -1953,10 +2191,6 @@ impl Workspace {
     pub fn focus_document(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.document.read(cx).focus_handle(cx));
     }
-
-    pub fn has_unsaved_changes(&self, cx: &App) -> bool {
-        self.document.read(cx).document().is_modified()
-    }
 }
 
 impl Focusable for Workspace {
@@ -2012,6 +2246,10 @@ impl Render for Workspace {
             .when(self.pending_tool.is_some(), |this| {
                 this.child(self.approval_panel(theme, cx))
             })
+            .when(
+                self.pending_discard.is_some() || self.close_confirmation_open,
+                |this| this.child(self.unsaved_panel(theme, cx)),
+            )
     }
 }
 
@@ -2177,8 +2415,10 @@ fn chat_message(
                             .cursor_pointer()
                             .hover(|style| style.bg(theme.hover))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.chat[index].show_reasoning = !this.chat[index].show_reasoning;
-                                cx.notify();
+                                if let Some(entry) = this.chat.get_mut(index) {
+                                    entry.show_reasoning = !entry.show_reasoning;
+                                    cx.notify();
+                                }
                             }))
                             .child(if entry.show_reasoning {
                                 tr(language, "hide_reasoning")

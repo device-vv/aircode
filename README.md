@@ -26,6 +26,7 @@ The executable is portable and currently **unsigned**, so Windows SmartScreen ma
 - Incremental Tree-sitter highlighting for Rust, Python, JavaScript, TypeScript, Go, C, C++, Java, C#, HTML, CSS, JSON, TOML, YAML, and Markdown. Only visible lines are rendered.
 - Project, editor, and agent panels with draggable splitters and saved widths.
 - Custom AIRcode title bar and application icon; working minimize, maximize/restore, and close controls. No console window on Windows.
+- Non-blocking file/folder dialogs and title-bar dragging across monitors, with repeated Windows window-state stress validation.
 - English and Russian interfaces. English is the default; Russian-system users are offered a one-time language switch.
 - Streaming AI chat with collapsible reasoning, cancellation, message copying, and context menus for cut/copy/paste/select all.
 - Optional document or selection context, limited to 200 KB per request.
@@ -174,6 +175,7 @@ AIRcode объединяет нативный GPUI-редактор, дерев�
 - Инкрементальная подсветка Tree-sitter для Rust, Python, JavaScript, TypeScript, Go, C, C++, Java, C#, HTML, CSS, JSON, TOML, YAML и Markdown. Отрисовываются только видимые строки.
 - Панели проекта, редактора и агента с изменяемой шириной и сохранением размеров.
 - Фирменная строка заголовка и иконка, рабочие сворачивание, разворачивание/восстановление и закрытие. Консоль Windows не открывается.
+- Неблокирующие диалоги файлов/папок и перетаскивание окна между мониторами; повторные стресс-проверки состояния окна Windows.
 - Английский и русский интерфейсы. По умолчанию английский; при русской системе предлагается однократное переключение.
 - Потоковый чат, сворачиваемые рассуждения, остановка, копирование сообщений и контекстное меню вырезания/копирования/вставки/выделения.
 - Контекст документа или выделения по выбору пользователя, до 200 КБ на запрос.

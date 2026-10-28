@@ -672,14 +672,15 @@ impl Element for TextElement {
         if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
-        let line = prepaint.line.take().unwrap();
-        line.paint(
+        let Some(line) = prepaint.line.take() else {
+            return;
+        };
+        let _ = line.paint(
             point(bounds.left() - prepaint.scroll_x, bounds.top()),
             window.line_height(),
             window,
             cx,
-        )
-        .unwrap();
+        );
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
         {

@@ -9,7 +9,6 @@ use gpui::{
     App, AppContext, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance,
     WindowBounds, WindowDecorations, WindowOptions, px, size,
 };
-use rfd::{MessageButtons, MessageDialog, MessageDialogResult};
 use workspace::Workspace;
 
 pub fn run() {
@@ -60,16 +59,7 @@ pub fn run() {
         window
             .update(cx, |_, window, cx| {
                 window.on_window_should_close(cx, move |_, cx| {
-                    if !workspace.read(cx).has_unsaved_changes(cx) {
-                        return true;
-                    }
-                    let workspace = workspace.read(cx);
-                    MessageDialog::new()
-                        .set_title(workspace.tr("unsaved_title"))
-                        .set_description(workspace.tr("unsaved_close"))
-                        .set_buttons(MessageButtons::YesNo)
-                        .show()
-                        == MessageDialogResult::Yes
+                    workspace.update(cx, |workspace, cx| workspace.should_close(cx))
                 });
             })
             .expect("failed to configure close confirmation");

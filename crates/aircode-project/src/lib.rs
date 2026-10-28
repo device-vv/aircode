@@ -203,4 +203,24 @@ mod tests {
         assert_eq!(names, ["main.rs"]);
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn removed_expanded_directories_do_not_break_refresh() {
+        let root =
+            std::env::temp_dir().join(format!("aircode-project-refresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/nested/lib.rs"), "pub fn value() {}\n").unwrap();
+        let mut project = Project::open(&root).unwrap();
+        project.toggle(&root.join("src"));
+        project.toggle(&root.join("src/nested"));
+        assert!(!project.visible_rows().is_empty());
+
+        fs::remove_dir_all(root.join("src")).unwrap();
+        project.refresh();
+        project.toggle(&root.join("src/nested"));
+
+        assert!(project.visible_rows().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

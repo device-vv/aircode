@@ -794,20 +794,18 @@ impl Element for DocumentElement {
                 bounds.left() + px(54.0),
                 bounds.top() + px(22.0 * index as f32),
             );
-            line.paint(origin, px(22.0), window, cx).unwrap();
+            let _ = line.paint(origin, px(22.0), window, cx);
             self.input.update(cx, |input, _| {
                 input.last_layouts.insert(index, line.clone());
             });
         }
         for (index, number) in prepaint.numbers.drain(..) {
-            number
-                .paint(
-                    point(bounds.left(), bounds.top() + px(22.0 * index as f32)),
-                    px(22.0),
-                    window,
-                    cx,
-                )
-                .unwrap();
+            let _ = number.paint(
+                point(bounds.left(), bounds.top() + px(22.0 * index as f32)),
+                px(22.0),
+                window,
+                cx,
+            );
         }
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()

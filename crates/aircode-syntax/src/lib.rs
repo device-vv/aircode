@@ -374,4 +374,39 @@ mod tests {
         assert!(kinds.contains(&HighlightKind::String));
         assert!(kinds.contains(&HighlightKind::Number));
     }
+
+    #[test]
+    fn every_language_handles_open_and_incremental_edit() {
+        let samples = [
+            (Language::Rust, "fn main() { let value = 1; }"),
+            (Language::Python, "def main():\n    return 1\n"),
+            (Language::JavaScript, "const main = () => 1;"),
+            (Language::TypeScript, "const main = (): number => 1;"),
+            (Language::Tsx, "const Main = () => <div />;"),
+            (Language::Go, "package main\nfunc main() {}\n"),
+            (Language::C, "int main(void) { return 0; }"),
+            (Language::Cpp, "int main() { return 0; }"),
+            (Language::Java, "class Main {}"),
+            (Language::CSharp, "class Main {}"),
+            (Language::Html, "<main>text</main>"),
+            (Language::Css, "main { color: red; }"),
+            (Language::Json, "{\"value\": 1}"),
+            (Language::Toml, "value = 1"),
+            (Language::Yaml, "value: 1"),
+            (Language::Markdown, "# Heading"),
+        ];
+
+        for (language, sample) in samples {
+            let mut highlighter = SyntaxHighlighter::new(language).unwrap();
+            highlighter.set_text(sample);
+            let updated = format!(" {sample}");
+            highlighter.replace_range(sample, &updated, 0..0, " ");
+            assert!(highlighter.spans().iter().all(|span| {
+                span.range.start <= span.range.end
+                    && span.range.end <= updated.len()
+                    && updated.is_char_boundary(span.range.start)
+                    && updated.is_char_boundary(span.range.end)
+            }));
+        }
+    }
 }
