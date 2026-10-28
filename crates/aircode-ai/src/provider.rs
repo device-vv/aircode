@@ -68,6 +68,7 @@ impl ReasoningEffort {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub region: Region,
@@ -128,26 +129,18 @@ impl ProviderConfig {
         }
     }
 
+    /// Remembers the region on every provider (so cycling through other providers does
+    /// not lose it) and picks the official endpoint for the Kimi profiles.
     pub fn with_region(mut self, region: Region) -> Self {
-        if matches!(
-            self.kind,
-            ProviderKind::KimiCode | ProviderKind::KimiPlatform
-        ) {
-            let model = self.model;
-            let effort = self.effort;
-            self = Self::new(self.kind);
-            self.region = region;
-            self.base_url = match (self.kind, region) {
-                (ProviderKind::KimiCode, Region::China) => "https://api.kimi.com/coding/v1",
-                (ProviderKind::KimiCode, Region::Overseas) => "https://api.kimi.ai/coding/v1",
-                (ProviderKind::KimiPlatform, Region::China) => "https://api.moonshot.cn/v1",
-                (ProviderKind::KimiPlatform, Region::Overseas) => "https://api.moonshot.ai/v1",
-                _ => unreachable!(),
-            }
-            .into();
-            self.model = model;
-            self.effort = effort;
-        }
+        self.region = region;
+        let base_url = match (self.kind, region) {
+            (ProviderKind::KimiCode, Region::China) => "https://api.kimi.com/coding/v1",
+            (ProviderKind::KimiCode, Region::Overseas) => "https://api.kimi.ai/coding/v1",
+            (ProviderKind::KimiPlatform, Region::China) => "https://api.moonshot.cn/v1",
+            (ProviderKind::KimiPlatform, Region::Overseas) => "https://api.moonshot.ai/v1",
+            _ => return self,
+        };
+        self.base_url = base_url.into();
         self
     }
 
@@ -172,7 +165,9 @@ impl ProviderConfig {
     }
 
     pub fn credential_id(&self) -> String {
-        format!("{}:{}", self.kind.label(), self.base_url)
+        let base = self.base_url.trim().trim_end_matches('/');
+        let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+        format!("{}:{}", self.kind.label(), base.trim_end_matches('/'))
     }
 
     pub fn session_compatible_with(&self, other: &Self) -> bool {

@@ -23,6 +23,7 @@ pub enum StreamEvent {
 #[derive(Debug)]
 pub enum AiError {
     Credentials(String),
+    Settings(String),
     InvalidEndpoint(String),
     Transport(String),
     HttpStatus(u16, String),
@@ -34,6 +35,7 @@ impl fmt::Display for AiError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Credentials(message) => write!(formatter, "Credential error: {message}"),
+            Self::Settings(message) => write!(formatter, "Settings error: {message}"),
             Self::InvalidEndpoint(message) => write!(formatter, "Invalid API endpoint: {message}"),
             Self::Transport(message) => write!(formatter, "Network error: {message}"),
             Self::HttpStatus(status, message) => write!(formatter, "API error {status}: {message}"),
@@ -54,6 +56,9 @@ impl AiClient {
         let client = reqwest::Client::builder()
             .user_agent(concat!("AIRcode/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
+            // Applies between received chunks, so long streams are fine but a dead
+            // connection no longer hangs forever.
+            .read_timeout(Duration::from_secs(120))
             .build()
             .map_err(|error| AiError::Transport(error.to_string()))?;
         Ok(Self { client })
@@ -107,10 +112,11 @@ impl AiClient {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "No error details returned".into());
+            let message = tokio::select! {
+                _ = cancel.cancelled() => return Err(AiError::Cancelled),
+                text = response.text() => text
+                    .unwrap_or_else(|_| "No error details returned".into()),
+            };
             let message = message.replace(api_key.expose(), "[REDACTED]");
             let message = match status.as_u16() {
                 400 if config.kind == crate::ProviderKind::KimiCode => format!(
@@ -132,49 +138,90 @@ impl AiClient {
         let mut tool_calls = HashMap::new();
         let mut stream = response.bytes_stream();
         let mut received = 0usize;
+        let mut finished = false;
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => return Err(AiError::Cancelled),
                 chunk = stream.next() => chunk,
             };
-            let Some(chunk) = chunk else {
-                break;
+            let (batch, closed) = match chunk {
+                Some(chunk) => {
+                    let chunk = chunk.map_err(|error| AiError::Transport(error.to_string()))?;
+                    received += chunk.len();
+                    if received > MAX_STREAM_BYTES {
+                        return Err(AiError::Protocol("Response exceeded 64 MiB".into()));
+                    }
+                    (decoder.push(&chunk).map_err(AiError::Protocol)?, false)
+                }
+                None => (decoder.finish().map_err(AiError::Protocol)?, true),
             };
-            let chunk = chunk.map_err(|error| AiError::Transport(error.to_string()))?;
-            received += chunk.len();
-            if received > MAX_STREAM_BYTES {
-                return Err(AiError::Protocol("Response exceeded 64 MiB".into()));
-            }
-            for data in decoder.push(&chunk).map_err(AiError::Protocol)? {
-                if data == "[DONE]" {
+            for data in batch {
+                if forward_event(&data, &events, &mut finished, &mut tool_calls)? {
                     emit_tool_calls(&mut tool_calls, &events);
                     let _ = events.send(StreamEvent::Done);
                     return Ok(());
                 }
-                let chunk: ChatCompletionChunk = serde_json::from_str(&data)
-                    .map_err(|error| AiError::Protocol(error.to_string()))?;
-                if let Some(usage) = chunk.usage {
-                    let _ = events.send(StreamEvent::Usage(usage));
-                }
-                for choice in chunk.choices {
-                    merge_tool_calls(&mut tool_calls, choice.delta.tool_calls);
-                    if let Some(reasoning) = choice.delta.reasoning_content
-                        && !reasoning.is_empty()
-                    {
-                        let _ = events.send(StreamEvent::ReasoningDelta(reasoning));
-                    }
-                    if let Some(content) = choice.delta.content
-                        && !content.is_empty()
-                    {
-                        let _ = events.send(StreamEvent::ContentDelta(content));
-                    }
-                }
+            }
+            if closed {
+                break;
             }
         }
+        if !finished {
+            return Err(AiError::Protocol(
+                "The stream ended before the response was complete".into(),
+            ));
+        }
+        emit_tool_calls(&mut tool_calls, &events);
         emit_tool_calls(&mut tool_calls, &events);
         let _ = events.send(StreamEvent::Done);
         Ok(())
     }
+}
+
+/// Handles one SSE `data:` payload. Returns `true` on the `[DONE]` sentinel.
+fn forward_event(
+    data: &str,
+    events: &mpsc::UnboundedSender<StreamEvent>,
+    finished: &mut bool,
+    tool_calls: &mut HashMap<usize, ToolCall>,
+) -> Result<bool, AiError> {
+    if data.trim() == "[DONE]" {
+        *finished = true;
+        return Ok(true);
+    }
+    let chunk: ChatCompletionChunk =
+        serde_json::from_str(data).map_err(|error| AiError::Protocol(error.to_string()))?;
+    if let Some(error) = chunk.error {
+        let message = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| error.to_string());
+        return Err(AiError::Protocol(message));
+    }
+    if let Some(usage) = chunk.usage {
+        let _ = events.send(StreamEvent::Usage(usage));
+    }
+    for choice in chunk.choices {
+        if choice.finish_reason.is_some() {
+            *finished = true;
+        }
+        let Some(delta) = choice.delta else {
+            continue;
+        };
+        merge_tool_calls(tool_calls, delta.tool_calls);
+        if let Some(reasoning) = delta.reasoning_content
+            && !reasoning.is_empty()
+        {
+            let _ = events.send(StreamEvent::ReasoningDelta(reasoning));
+        }
+        if let Some(content) = delta.content
+            && !content.is_empty()
+        {
+            let _ = events.send(StreamEvent::ContentDelta(content));
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Deserialize)]
@@ -182,11 +229,14 @@ struct ChatCompletionChunk {
     #[serde(default)]
     choices: Vec<Choice>,
     usage: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct Choice {
-    delta: Delta,
+    /// Some gateways send a final choice without `delta` (or with `"delta": null`).
+    delta: Option<Delta>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -38,7 +38,7 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub fn new() -> Result<Self, AiError> {
         let directories = ProjectDirs::from("dev", "AIRcode", "AIRcode").ok_or_else(|| {
-            AiError::Credentials("Cannot locate the application settings directory".into())
+            AiError::Settings("Cannot locate the application settings directory".into())
         })?;
         Ok(Self {
             path: directories.config_dir().join("settings.toml"),
@@ -53,18 +53,23 @@ impl SettingsStore {
         if !self.path.exists() {
             return Ok(AppSettings::default());
         }
-        let text = fs::read_to_string(&self.path)
-            .map_err(|error| AiError::Credentials(error.to_string()))?;
-        toml::from_str(&text).map_err(|error| AiError::Credentials(error.to_string()))
+        let text =
+            fs::read_to_string(&self.path).map_err(|error| AiError::Settings(error.to_string()))?;
+        toml::from_str(&text).map_err(|error| AiError::Settings(error.to_string()))
     }
 
     pub fn save(&self, settings: &AppSettings) -> Result<(), AiError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| AiError::Credentials(error.to_string()))?;
+            fs::create_dir_all(parent).map_err(|error| AiError::Settings(error.to_string()))?;
         }
         let text = toml::to_string_pretty(settings)
-            .map_err(|error| AiError::Credentials(error.to_string()))?;
-        fs::write(&self.path, text).map_err(|error| AiError::Credentials(error.to_string()))
+            .map_err(|error| AiError::Settings(error.to_string()))?;
+        let temporary = self.path.with_extension("toml.tmp");
+        fs::write(&temporary, text).map_err(|error| AiError::Settings(error.to_string()))?;
+        fs::rename(&temporary, &self.path).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            AiError::Settings(error.to_string())
+        })
     }
 }
 

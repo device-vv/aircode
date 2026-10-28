@@ -33,6 +33,7 @@ The executable is portable and currently **unsigned**, so Windows SmartScreen ma
 - Project agent tools: list, read, search, write, create directories, move, delete, and run commands. The agent is limited to eight tool steps per session.
 - Three permission modes: **Ask every action**, **Ask important only**, and **Full access**. Approval includes the tool arguments and a diff for file writes. An activity log records tool calls and results.
 - Light and dark themes, native Kimi Code support, and custom OpenAI-compatible providers.
+- 56 unit and contract tests plus an exercised Windows UI and mock SSE workflow.
 
 Not included yet: LSP, debugging/DAP, Git operations, an integrated terminal, multi-tab editing, and signed installers. Files larger than 16 MiB are rejected. macOS and Linux remain compile targets, not published or runtime-validated releases.
 

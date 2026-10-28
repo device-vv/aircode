@@ -11,6 +11,20 @@ use gpui::{
     fill, point, prelude::*, px, relative, rgba, size,
 };
 
+const LINE_HEIGHT: f32 = 22.0;
+
+/// UTF-16 offset inside `text` -> byte offset (clamped to the end).
+pub(crate) fn utf16_to_byte(text: &str, offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (index, character) in text.char_indices() {
+        if utf16 >= offset {
+            return index;
+        }
+        utf16 += character.len_utf16();
+    }
+    text.len()
+}
+
 actions!(
     aircode_document,
     [
@@ -54,6 +68,7 @@ pub fn register_actions(cx: &mut App) {
         KeyBinding::new("secondary-x", Cut, Some("Document")),
         KeyBinding::new("secondary-z", Undo, Some("Document")),
         KeyBinding::new("secondary-y", Redo, Some("Document")),
+        KeyBinding::new("secondary-shift-z", Redo, Some("Document")),
         KeyBinding::new("enter", InsertNewline, Some("Document")),
         KeyBinding::new("tab", InsertTab, Some("Document")),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("Document")),
@@ -72,6 +87,9 @@ pub struct DocumentView {
     context_menu_open: bool,
     syntax: Option<SyntaxHighlighter>,
     scroll_handle: ScrollHandle,
+    /// Set while an overlay (settings, palette) is open so keystrokes cannot reach the text.
+    read_only: bool,
+    reveal_cursor: bool,
 }
 
 impl DocumentView {
@@ -88,7 +106,23 @@ impl DocumentView {
             context_menu_open: false,
             syntax: None,
             scroll_handle: ScrollHandle::new(),
+            read_only: false,
+            reveal_cursor: false,
         }
+    }
+
+    pub fn scroll_handle(&self) -> ScrollHandle {
+        self.scroll_handle.clone()
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    /// One-based `(line, column)` of the caret (not of the selection end).
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let (line, column) = self.document.line_col_at(self.cursor_offset());
+        (line + 1, column + 1)
     }
 
     pub fn document(&self) -> &Document {
@@ -109,7 +143,9 @@ impl DocumentView {
         }
         self.document = document;
         self.marked_range = None;
+        self.selection_reversed = false;
         self.last_layouts.clear();
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -124,6 +160,7 @@ impl DocumentView {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let _ = self.document.set_selection(offset..offset);
         self.selection_reversed = false;
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -139,6 +176,7 @@ impl DocumentView {
             range = range.end..range.start;
         }
         let _ = self.document.set_selection(range);
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -173,14 +211,17 @@ impl DocumentView {
     }
 
     fn vertical_offset(&self, direction: isize) -> usize {
-        let cursor = self.cursor_offset();
-        let (line, column) = self.line_column(cursor);
-        let target_line = if direction < 0 {
-            line.saturating_sub(1)
+        let (line, column) = self.document.line_col_at(self.cursor_offset());
+        if direction < 0 {
+            if line == 0 {
+                return 0;
+            }
+            self.document.offset_for_line_col(line - 1, column)
+        } else if line + 1 >= self.document.line_count() {
+            self.document.text().len()
         } else {
-            line + 1
-        };
-        self.offset_for_line_column(target_line, column)
+            self.document.offset_for_line_col(line + 1, column)
+        }
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -197,14 +238,13 @@ impl DocumentView {
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, _) = self.line_column(self.cursor_offset());
-        self.move_to(self.offset_for_line_column(line, 0), cx);
+        let line = self.document.line_of_offset(self.cursor_offset());
+        self.move_to(self.document.line_range(line).start, cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, _) = self.line_column(self.cursor_offset());
-        let end = self.line_ranges()[line].end;
-        self.move_to(end, cx);
+        let line = self.document.line_of_offset(self.cursor_offset());
+        self.move_to(self.document.line_range(line).end, cx);
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -245,7 +285,13 @@ impl DocumentView {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         self.document.undo();
+        self.marked_range = None;
+        self.selection_reversed = false;
+        self.reveal_cursor = true;
         if let Some(syntax) = &mut self.syntax {
             syntax.set_text(self.document.text());
         }
@@ -254,7 +300,13 @@ impl DocumentView {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         self.document.redo();
+        self.marked_range = None;
+        self.selection_reversed = false;
+        self.reveal_cursor = true;
         if let Some(syntax) = &mut self.syntax {
             syntax.set_text(self.document.text());
         }
@@ -393,52 +445,16 @@ impl DocumentView {
         let Some(bounds) = self.last_bounds else {
             return 0;
         };
-        let line_height = px(22.0);
-        let line = ((position.y - bounds.top()) / line_height).floor().max(0.0) as usize;
-        let line = line.min(self.line_ranges().len().saturating_sub(1));
+        let line = ((position.y - bounds.top()) / px(LINE_HEIGHT))
+            .floor()
+            .max(0.0) as usize;
+        let line = line.min(self.document.line_count() - 1);
+        let range = self.document.line_range(line);
         let Some(layout) = self.last_layouts.get(&line) else {
-            return 0;
+            return range.start;
         };
-        let line_start = self.line_ranges()[line].start;
-        line_start + layout.closest_index_for_x(position.x - bounds.left() - px(54.0))
-    }
-
-    fn line_ranges(&self) -> Vec<Range<usize>> {
-        let text = self.document.text();
-        let mut ranges = Vec::new();
-        let mut start = 0;
-        for (index, character) in text.char_indices() {
-            if character == '\n' {
-                ranges.push(start..index);
-                start = index + 1;
-            }
-        }
-        ranges.push(start..text.len());
-        ranges
-    }
-
-    fn line_column(&self, offset: usize) -> (usize, usize) {
-        let ranges = self.line_ranges();
-        let line = ranges
-            .iter()
-            .position(|range| offset >= range.start && offset <= range.end)
-            .unwrap_or(ranges.len().saturating_sub(1));
-        (line, offset - ranges[line].start)
-    }
-
-    fn offset_for_line_column(&self, line: usize, column: usize) -> usize {
-        let ranges = self.line_ranges();
-        let line = line.min(ranges.len().saturating_sub(1));
-        let range = &ranges[line];
-        let line_text = &self.document.text()[range.clone()];
-        let mut utf8_column = 0;
-        for (index, character) in line_text.char_indices() {
-            if index >= column {
-                break;
-            }
-            utf8_column = index + character.len_utf8();
-        }
-        range.start + utf8_column.min(range.len())
+        let x = position.x - bounds.left() - px(54.0);
+        (range.start + layout.closest_index_for_x(x)).min(range.end)
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
@@ -518,6 +534,9 @@ impl EntityInputHandler for DocumentView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -531,6 +550,7 @@ impl EntityInputHandler for DocumentView {
             self.selection_reversed = false;
             self.marked_range = None;
             self.last_layouts.clear();
+            self.reveal_cursor = true;
             cx.notify();
         }
     }
@@ -543,6 +563,9 @@ impl EntityInputHandler for DocumentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let insertion_start = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
@@ -554,10 +577,12 @@ impl EntityInputHandler for DocumentView {
             self.marked_range = Some(insertion_start..insertion_start + new_text.len());
         }
         if let Some(selection) = new_selected_range_utf16 {
-            let selection = self.range_from_utf16(&selection);
+            // The IME reports the selection relative to the composed text, not the document.
+            let start = utf16_to_byte(new_text, selection.start);
+            let end = utf16_to_byte(new_text, selection.end);
             let _ = self
                 .document
-                .set_selection(insertion_start + selection.start..insertion_start + selection.end);
+                .set_selection(insertion_start + start..insertion_start + end);
         }
         cx.notify();
     }
@@ -570,8 +595,14 @@ impl EntityInputHandler for DocumentView {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range_utf16);
-        let (start_line, start_column) = self.line_column(range.start);
-        let (end_line, end_column) = self.line_column(range.end);
+        let start_line = self.document.line_of_offset(range.start);
+        let end_line = self.document.line_of_offset(range.end);
+        let start_column = range
+            .start
+            .saturating_sub(self.document.line_range(start_line).start);
+        let end_column = range
+            .end
+            .saturating_sub(self.document.line_range(end_line).start);
         let start_layout = self.last_layouts.get(&start_line)?;
         let end_layout = self.last_layouts.get(&end_line)?;
         Some(Bounds::from_corners(
@@ -634,10 +665,10 @@ impl Element for DocumentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let line_count = self.input.read(cx).line_ranges().len();
+        let line_count = self.input.read(cx).document.line_count();
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
-        style.size.height = px(22.0 * line_count as f32).into();
+        style.size.height = px(LINE_HEIGHT * line_count as f32).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -651,25 +682,28 @@ impl Element for DocumentElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let text = input.document.text();
-        let selection = input.document.selection();
+        let document = &input.document;
+        let text = document.text();
+        let selection = document.selection();
         let cursor = input.cursor_offset();
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_ranges = input.line_ranges();
+        let line_count = document.line_count();
         let scroll_offset = -input.scroll_handle.offset().y;
         let first = (scroll_offset / px(22.0)).floor().max(0.0) as usize;
         let visible = (input.scroll_handle.bounds().size.height / px(22.0))
             .ceil()
             .max(1.0) as usize
             + 2;
-        let last = (first + visible).min(line_ranges.len());
+        let first = first.min(line_count);
+        let last = (first + visible).min(line_count);
         let mut lines = Vec::new();
         let mut numbers = Vec::new();
         let mut selection_quads = Vec::new();
         let mut cursor_quad = None;
 
-        for (line_index, range) in line_ranges.iter().enumerate().take(last).skip(first) {
+        for line_index in first..last {
+            let range = &document.line_range(line_index);
             let line_text = &text[range.clone()];
             let run = TextRun {
                 len: line_text.len(),
@@ -732,7 +766,7 @@ impl Element for DocumentElement {
             );
             let top = bounds.top() + px(22.0 * line_index as f32);
 
-            let selected_start = selection.start.max(range.start);
+            let selected_start = selection.start.max(range.start).min(range.end);
             let selected_end = selection.end.min(range.end);
             if selected_start < selected_end
                 || (selection.start <= range.end
@@ -812,9 +846,44 @@ impl Element for DocumentElement {
         {
             window.paint_quad(cursor);
         }
+        let visible = window.content_mask().bounds;
         self.input.update(cx, |input, _| {
+            // A different size means the window moved to another monitor or was resized;
+            // layouts shaped for the old geometry must not be used for hit testing.
+            if input.last_bounds.is_some_and(|old| old.size != bounds.size) {
+                input.last_layouts.retain(|_, _| false);
+            }
             input.last_bounds = Some(bounds);
+            if std::mem::take(&mut input.reveal_cursor) {
+                input.scroll_cursor_into_view(bounds, visible, window);
+            }
         });
+    }
+}
+
+impl DocumentView {
+    /// Scrolls the document so the caret line is inside `visible`.
+    fn scroll_cursor_into_view(
+        &self,
+        bounds: Bounds<Pixels>,
+        visible: Bounds<Pixels>,
+        window: &mut Window,
+    ) {
+        let line = self.document.line_of_offset(self.cursor_offset());
+        let top = bounds.top() + px(LINE_HEIGHT * line as f32);
+        let bottom = top + px(LINE_HEIGHT);
+        let delta = if top < visible.top() {
+            visible.top() - top
+        } else if bottom > visible.bottom() {
+            visible.bottom() - bottom
+        } else {
+            return;
+        };
+        let offset = self.scroll_handle.offset();
+        self.scroll_handle
+            .set_offset(point(offset.x, offset.y + delta));
+        // `refresh()` is ignored while drawing; schedule it for the next frame.
+        window.on_next_frame(|window, _| window.refresh());
     }
 }
 
@@ -871,6 +940,8 @@ impl Render for DocumentView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .relative()
+            // Fill the editor area so a click below the last line still focuses the editor.
+            .size_full()
             .id("document-editor-scroll")
             .key_context("Document")
             .track_focus(&self.focus_handle(cx))

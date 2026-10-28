@@ -102,6 +102,29 @@ impl TextInput {
         self.masked = masked;
     }
 
+    /// Masked fields show one `*` per character, so byte offsets must be translated.
+    fn to_display(&self, index: usize) -> usize {
+        if self.masked {
+            self.content[..index.min(self.content.len())]
+                .chars()
+                .count()
+        } else {
+            index
+        }
+    }
+
+    fn content_index(&self, index: usize) -> usize {
+        if self.masked {
+            self.content
+                .char_indices()
+                .nth(index)
+                .map(|(byte, _)| byte)
+                .unwrap_or(self.content.len())
+        } else {
+            index
+        }
+    }
+
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         let offset = if self.selected_range.is_empty() {
             self.previous_boundary(self.cursor_offset())
@@ -281,7 +304,7 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -289,7 +312,7 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -325,7 +348,9 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left() + self.last_scroll_x)
+        self.content_index(
+            line.closest_index_for_x(position.x - bounds.left() + self.last_scroll_x),
+        )
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -456,14 +481,23 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let start = range_utf16
+            .as_ref()
+            .map(|range| self.range_from_utf16(range))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone())
+            .start;
         self.replace_text_in_range(range_utf16, new_text, window, cx);
-        if !new_text.is_empty() {
-            let start = self.selected_range.start.saturating_sub(new_text.len());
-            self.marked_range = Some(start..start + new_text.len());
+        let inserted = self.selected_range.start - start;
+        if inserted > 0 {
+            self.marked_range = Some(start..start + inserted);
         }
         if let Some(selection) = new_selected_range_utf16 {
-            let selection = self.range_from_utf16(&selection);
-            self.selected_range = selection;
+            // Relative to the composed text, not to the whole field.
+            let composed = &self.content[start..start + inserted];
+            let from = crate::document::utf16_to_byte(composed, selection.start);
+            let to = crate::document::utf16_to_byte(composed, selection.end);
+            self.selected_range = start + from..start + to;
         }
         cx.notify();
     }
@@ -479,11 +513,11 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + line.x_for_index(range.start) - self.last_scroll_x,
+                bounds.left() + line.x_for_index(self.to_display(range.start)) - self.last_scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + line.x_for_index(range.end) - self.last_scroll_x,
+                bounds.left() + line.x_for_index(self.to_display(range.end)) - self.last_scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -580,7 +614,11 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+        let runs = if let Some(marked_range) = input
+            .marked_range
+            .as_ref()
+            .filter(|_| !input.masked && !input.content.is_empty())
+        {
             vec![
                 TextRun {
                     len: marked_range.start,
@@ -610,11 +648,12 @@ impl Element for TextElement {
         let line = window
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
-        let cursor_pos = line.x_for_index(cursor);
+        let cursor_pos = line.x_for_index(input.to_display(cursor));
         let scroll_x = if selected_range.is_empty() {
             (cursor_pos - bounds.size.width + px(12.0)).max(px(0.0))
         } else {
-            (line.x_for_index(selected_range.end) - bounds.size.width + px(12.0)).max(px(0.0))
+            (line.x_for_index(input.to_display(selected_range.end)) - bounds.size.width + px(12.0))
+                .max(px(0.0))
         };
         let (selection, cursor) = if selected_range.is_empty() {
             (
@@ -632,11 +671,14 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start) - scroll_x,
+                            bounds.left()
+                                + line.x_for_index(input.to_display(selected_range.start))
+                                - scroll_x,
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end) - scroll_x,
+                            bounds.left() + line.x_for_index(input.to_display(selected_range.end))
+                                - scroll_x,
                             bounds.bottom(),
                         ),
                     ),

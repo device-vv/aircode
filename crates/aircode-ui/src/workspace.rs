@@ -14,8 +14,8 @@ use aircode_i18n::{Language, system_is_russian, tr};
 use aircode_project::{Project, RecommendedWatcher};
 use gpui::{
     App, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight,
-    KeyBinding, MouseButton, PathPromptOptions, Rgba, Window, WindowControlArea, actions, div,
-    prelude::*, px,
+    KeyBinding, MouseButton, PathPromptOptions, Rgba, ScrollHandle, Window, WindowControlArea,
+    actions, div, point, prelude::*, px,
 };
 use tokio::{runtime::Runtime, sync::mpsc};
 use tokio_util::sync::CancellationToken;
@@ -39,6 +39,9 @@ actions!(
         TogglePalette,
         ToggleSettings,
         ToggleTheme,
+        PaletteUp,
+        PaletteDown,
+        PaletteConfirm,
     ]
 );
 
@@ -57,6 +60,9 @@ pub fn register_actions(cx: &mut App) {
         KeyBinding::new("secondary-,", ToggleSettings, None),
         KeyBinding::new("ctrl-enter", SendMessage, None),
         KeyBinding::new("secondary-enter", SendMessage, None),
+        KeyBinding::new("up", PaletteUp, Some("Palette")),
+        KeyBinding::new("down", PaletteDown, Some("Palette")),
+        KeyBinding::new("enter", PaletteConfirm, Some("Palette")),
     ]);
 }
 
@@ -92,20 +98,11 @@ pub fn register_global_actions(workspace: Entity<Workspace>, cx: &mut App) {
     });
     let view = workspace.clone();
     cx.on_action(move |_: &TogglePalette, cx| {
-        view.update(cx, |this, cx| {
-            this.state.toggle_palette();
-            cx.notify();
-        });
+        view.update(cx, |this, cx| this.toggle_palette(cx));
     });
     let view = workspace.clone();
     cx.on_action(move |_: &CloseOverlay, cx| {
-        view.update(cx, |this, cx| {
-            this.state.close_palette();
-            this.settings_open = false;
-            this.pending_discard = None;
-            this.close_confirmation_open = false;
-            cx.notify();
-        });
+        view.update(cx, |this, cx| this.close_overlays(cx));
     });
     let view = workspace.clone();
     cx.on_action(move |_: &ToggleAi, cx| {
@@ -129,10 +126,7 @@ pub fn register_global_actions(workspace: Entity<Workspace>, cx: &mut App) {
         });
     });
     cx.on_action(move |_: &ToggleSettings, cx| {
-        workspace.update(cx, |this, cx| {
-            this.settings_open = !this.settings_open;
-            cx.notify();
-        });
+        workspace.update(cx, |this, cx| this.toggle_settings(cx));
     });
 }
 
@@ -142,6 +136,45 @@ struct ChatEntry {
     content: String,
     reasoning: String,
     show_reasoning: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dropdown {
+    Provider,
+    Region,
+    Model,
+    Effort,
+    /// Model picker opened from the chat header badge.
+    ChatModel,
+}
+
+#[derive(Clone, Copy)]
+enum FocusTarget {
+    Document,
+    Palette,
+    Settings,
+}
+
+/// (translation key of the label, shortcut, command)
+const PALETTE_COMMANDS: [(&str, &str, PaletteCommand); 7] = [
+    ("palette_open", "Ctrl O", PaletteCommand::Open),
+    ("palette_save", "Ctrl S", PaletteCommand::Save),
+    ("palette_new_chat", "Ctrl Shift N", PaletteCommand::NewChat),
+    ("palette_settings", "Ctrl ,", PaletteCommand::Settings),
+    ("palette_focus", "Ctrl Shift F", PaletteCommand::Focus),
+    ("palette_ai", "Ctrl Shift I", PaletteCommand::Ai),
+    ("palette_theme", "Ctrl Shift T", PaletteCommand::Theme),
+];
+
+/// Monospace face that actually exists on the platform (gpui has no generic "monospace").
+fn editor_font() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Consolas"
+    } else if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "DejaVu Sans Mono"
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -251,6 +284,10 @@ pub struct Workspace {
     api_key_input: Entity<TextInput>,
     base_url_input: Entity<TextInput>,
     model_input: Entity<TextInput>,
+    palette_input: Entity<TextInput>,
+    palette_selected: usize,
+    pending_focus: Option<FocusTarget>,
+    chat_scroll: ScrollHandle,
     settings: AppSettings,
     settings_store: Option<SettingsStore>,
     permission: PermissionMode,
@@ -261,6 +298,7 @@ pub struct Workspace {
     agent_steps: u8,
     audit: Vec<String>,
     settings_open: bool,
+    dropdown: Option<Dropdown>,
     key_saved: bool,
     status: String,
     chat: Vec<ChatEntry>,
@@ -309,12 +347,33 @@ impl Workspace {
         base_url_input.update(cx, |input, _| input.set_language(language));
         let model_input = cx.new(|cx| TextInput::new(tr(language, "model_id"), cx));
         model_input.update(cx, |input, _| input.set_language(language));
+        let palette_input = cx.new(|cx| TextInput::new(tr(language, "palette_filter"), cx));
+        palette_input.update(cx, |input, _| input.set_language(language));
         base_url_input.update(cx, |input, cx| {
             input.set_text(settings.provider.base_url.clone(), cx);
         });
         model_input.update(cx, |input, cx| {
             input.set_text(settings.provider.model.clone(), cx);
         });
+        cx.observe(&model_input, |this, input, cx| {
+            let text = input.read(cx).text().trim().to_string();
+            if text != this.settings.provider.model {
+                let previous = this.settings.provider.clone();
+                this.settings.provider.model = text;
+                this.settings_changed(&previous, cx);
+            }
+        })
+        .detach();
+        cx.observe(&base_url_input, |this, input, cx| {
+            let text = input.read(cx).text().trim().to_string();
+            if text != this.settings.provider.base_url {
+                let previous = this.settings.provider.clone();
+                this.settings.provider.base_url = text;
+                this.reload_key_state();
+                this.settings_changed(&previous, cx);
+            }
+        })
+        .detach();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -349,9 +408,14 @@ impl Workspace {
             tool_running: false,
             agent_steps: 0,
             audit: Vec::new(),
+            palette_input,
+            palette_selected: 0,
+            pending_focus: None,
+            chat_scroll: ScrollHandle::new(),
             settings,
             settings_store,
             settings_open: false,
+            dropdown: None,
             key_saved,
             status,
             chat: Vec::new(),
@@ -360,6 +424,86 @@ impl Workspace {
             generation: 0,
             runtime: Arc::new(runtime),
             client,
+        }
+    }
+
+    fn overlay_open(&self) -> bool {
+        self.settings_open
+            || self.state.palette_open
+            || self.pending_discard.is_some()
+            || self.close_confirmation_open
+    }
+
+    fn toggle_palette(&mut self, cx: &mut Context<Self>) {
+        if self.state.palette_open {
+            self.close_overlays(cx);
+            return;
+        }
+        self.settings_open = false;
+        self.state.toggle_palette();
+        self.palette_selected = 0;
+        self.palette_input.update(cx, |input, cx| input.clear(cx));
+        self.pending_focus = Some(FocusTarget::Palette);
+        cx.notify();
+    }
+
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_open {
+            self.close_overlays(cx);
+        } else {
+            self.open_settings(cx);
+        }
+    }
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.state.close_palette();
+        self.settings_open = true;
+        self.pending_focus = Some(FocusTarget::Settings);
+        cx.notify();
+    }
+
+    fn close_overlays(&mut self, cx: &mut Context<Self>) {
+        self.state.close_palette();
+        self.settings_open = false;
+        self.pending_discard = None;
+        self.close_confirmation_open = false;
+        self.dropdown = None;
+        self.pending_focus = Some(FocusTarget::Document);
+        cx.notify();
+    }
+
+    fn settings_changed(&mut self, previous: &ProviderConfig, cx: &mut Context<Self>) {
+        if !self.settings.provider.session_compatible_with(previous) {
+            self.new_chat(cx);
+        }
+        self.persist_settings();
+        cx.notify();
+    }
+
+    fn filtered_commands(&self, cx: &App) -> Vec<usize> {
+        let query = self.palette_input.read(cx).text().trim().to_lowercase();
+        PALETTE_COMMANDS
+            .iter()
+            .enumerate()
+            .filter(|(_, (label_key, _, _))| self.tr(label_key).to_lowercase().contains(&query))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.filtered_commands(cx).len();
+        if count > 0 {
+            self.palette_selected =
+                (self.palette_selected as isize + delta).rem_euclid(count as isize) as usize;
+        }
+        cx.notify();
+    }
+
+    fn confirm_palette(&mut self, cx: &mut Context<Self>) {
+        let matches = self.filtered_commands(cx);
+        if let Some(index) = matches.get(self.palette_selected.min(matches.len().saturating_sub(1)))
+        {
+            self.execute_palette_command(PALETTE_COMMANDS[*index].2, cx);
         }
     }
 
@@ -723,7 +867,7 @@ impl Workspace {
         let key = match CredentialStore::load(&self.settings.provider.credential_id()) {
             Ok(Some(key)) => key,
             Ok(None) => {
-                self.settings_open = true;
+                self.open_settings(cx);
                 self.status = "Add an API key for the selected provider".into();
                 cx.notify();
                 return;
@@ -737,6 +881,7 @@ impl Workspace {
         let mut request_messages: Vec<ChatMessage> = self
             .chat
             .iter()
+            .filter(|entry| !(entry.role == MessageRole::Assistant && entry.content.is_empty()))
             .map(|entry| ChatMessage {
                 role: entry.role,
                 content: entry.content.clone(),
@@ -783,6 +928,7 @@ impl Workspace {
         self.cancel = Some(cancel.clone());
         self.streaming = true;
         self.status = format!("Connecting to {}...", self.settings.provider.kind.label());
+        self.chat_scroll.scroll_to_bottom();
         let config = self.settings.provider.clone();
         self.agent_messages = request_messages.clone();
         self.current_config = config.clone();
@@ -817,14 +963,19 @@ impl Workspace {
         if generation != self.generation {
             return;
         }
-        let Some(entry) = self.chat.last_mut() else {
-            return;
-        };
         match event {
-            StreamEvent::ReasoningDelta(delta) => entry.reasoning.push_str(&delta),
+            StreamEvent::ReasoningDelta(delta) => {
+                if let Some(entry) = self.chat.last_mut() {
+                    entry.reasoning.push_str(&delta);
+                }
+                self.chat_scroll.scroll_to_bottom();
+            }
             StreamEvent::ContentDelta(delta) => {
-                entry.content.push_str(&delta);
+                if let Some(entry) = self.chat.last_mut() {
+                    entry.content.push_str(&delta);
+                }
                 self.status = "Receiving response...".into();
+                self.chat_scroll.scroll_to_bottom();
             }
             StreamEvent::ToolCall(call) => {
                 let diff = self.tool_diff(&call);
@@ -858,6 +1009,27 @@ impl Workspace {
                 self.streaming = false;
                 self.tool_running = false;
                 self.cancel = None;
+                // Nothing was produced: drop the empty reply and give the question back,
+                // so the history never contains a dangling "Thinking..." entry.
+                if self.chat.last().is_some_and(|entry| {
+                    entry.role == MessageRole::Assistant && entry.content.is_empty()
+                }) {
+                    self.chat.pop();
+                    if self
+                        .chat
+                        .last()
+                        .is_some_and(|entry| entry.role == MessageRole::User)
+                    {
+                        let question = self.chat.pop().map(|entry| entry.content);
+                        if let Some(question) = question {
+                            self.chat_input.update(cx, |input, cx| {
+                                if input.text().is_empty() {
+                                    input.set_text(question, cx);
+                                }
+                            });
+                        }
+                    }
+                }
                 self.status = error;
             }
             StreamEvent::Done => {
@@ -1046,55 +1218,57 @@ impl Workspace {
         }
     }
 
-    fn select_provider(&mut self, cx: &mut Context<Self>) {
-        let current = ProviderKind::ALL
-            .iter()
-            .position(|kind| *kind == self.settings.provider.kind)
-            .unwrap_or(0);
-        let kind = ProviderKind::ALL[(current + 1) % ProviderKind::ALL.len()];
-        let region = self.settings.provider.region;
-        self.settings.provider = ProviderConfig::new(kind).with_region(region);
-        self.update_config_inputs(cx);
-        self.reload_key_state();
-        self.new_chat(cx);
-        self.persist_settings();
-    }
-
-    fn select_region(&mut self, cx: &mut Context<Self>) {
-        let region = match self.settings.provider.region {
-            Region::China => Region::Overseas,
-            Region::Overseas => Region::China,
+    fn toggle_dropdown(&mut self, kind: Dropdown, cx: &mut Context<Self>) {
+        self.dropdown = if self.dropdown == Some(kind) {
+            None
+        } else {
+            Some(kind)
         };
-        self.settings.provider = self.settings.provider.clone().with_region(region);
-        self.update_config_inputs(cx);
-        self.reload_key_state();
-        self.new_chat(cx);
-        self.persist_settings();
+        cx.notify();
     }
 
-    fn select_model(&mut self, cx: &mut Context<Self>) {
-        let options = self.settings.provider.model_options();
-        if options.is_empty() {
-            return;
+    /// Applies the option at `index` of the given dropdown and closes it.
+    fn apply_dropdown(&mut self, kind: Dropdown, index: usize, cx: &mut Context<Self>) {
+        self.dropdown = None;
+        let previous = self.settings.provider.clone();
+        match kind {
+            Dropdown::Provider => {
+                let Some(new_kind) = ProviderKind::ALL.get(index).copied() else {
+                    return;
+                };
+                if new_kind != previous.kind {
+                    self.settings.provider =
+                        ProviderConfig::new(new_kind).with_region(previous.region);
+                }
+            }
+            Dropdown::Region => {
+                let region = if index == 0 {
+                    Region::China
+                } else {
+                    Region::Overseas
+                };
+                self.settings.provider = previous.clone().with_region(region);
+            }
+            Dropdown::Model | Dropdown::ChatModel => {
+                let Some(model) = previous.model_options().get(index) else {
+                    return;
+                };
+                self.settings.provider.model = (*model).into();
+            }
+            Dropdown::Effort => {
+                let Some(effort) = ReasoningEffort::ALL.get(index).copied() else {
+                    return;
+                };
+                self.settings.provider.effort = effort;
+            }
         }
-        let current = options
-            .iter()
-            .position(|model| *model == self.settings.provider.model)
-            .unwrap_or(0);
-        self.settings.provider.model = options[(current + 1) % options.len()].into();
-        self.update_config_inputs(cx);
-        self.new_chat(cx);
-        self.persist_settings();
-    }
-
-    fn select_effort(&mut self, cx: &mut Context<Self>) {
-        let current = ReasoningEffort::ALL
-            .iter()
-            .position(|effort| *effort == self.settings.provider.effort)
-            .unwrap_or(1);
-        self.settings.provider.effort = ReasoningEffort::ALL[(current + 1) % 3];
-        self.new_chat(cx);
-        self.persist_settings();
+        if self.settings.provider != previous {
+            self.update_config_inputs(cx);
+            self.reload_key_state();
+            self.new_chat(cx);
+            self.persist_settings();
+        }
+        cx.notify();
     }
 
     fn update_config_inputs(&self, cx: &mut Context<Self>) {
@@ -1288,10 +1462,7 @@ impl Workspace {
                     .text_color(theme.muted)
                     .cursor_pointer()
                     .hover(|style| style.border_color(theme.accent))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.toggle_palette();
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_palette(cx)))
                     .child(self.tr("commands"))
                     .child(keycap("Ctrl P", theme)),
             )
@@ -1354,10 +1525,7 @@ impl Workspace {
                             self.settings_open,
                             theme,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.settings_open = !this.settings_open;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_settings(cx))),
                     )
                     .child(
                         action_button(
@@ -1564,6 +1732,7 @@ impl Workspace {
             .flex_col()
             .flex_1()
             .min_w(px(0.0))
+            .min_h(px(0.0))
             .bg(theme.window)
             .child(
                 div()
@@ -1588,15 +1757,23 @@ impl Workspace {
             .child(
                 div()
                     .flex_1()
+                    // Without this the flex item grows to the text height and never scrolls.
+                    .min_h(px(0.0))
+                    .relative()
                     .py_3()
-                    .font_family("monospace")
+                    .font_family(editor_font())
                     .text_sm()
-                    .child(self.document.clone()),
+                    .child(self.document.clone())
+                    .child(document_scrollbar(
+                        self.document.read(cx).scroll_handle(),
+                        theme,
+                    )),
             )
     }
 
     fn assistant_panel(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .relative()
             .flex()
             .flex_col()
             .w(px(self.settings.right_width))
@@ -1617,15 +1794,36 @@ impl Workspace {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("AIR assistant"),
                     )
-                    .child(badge(
-                        self.settings.provider.model.clone(),
-                        theme.accent_soft,
-                        theme.accent,
-                    )),
+                    .child(
+                        div()
+                            .id("model-badge")
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.settings.provider.model_options().is_empty() {
+                                    this.open_settings(cx);
+                                } else {
+                                    this.toggle_dropdown(Dropdown::ChatModel, cx);
+                                }
+                            }))
+                            .child(badge(
+                                format!(
+                                    "{}  {}",
+                                    self.settings.provider.model,
+                                    if self.dropdown == Some(Dropdown::ChatModel) {
+                                        "\u{25B4}"
+                                    } else {
+                                        "\u{25BE}"
+                                    }
+                                ),
+                                theme.accent_soft,
+                                theme.accent,
+                            )),
+                    ),
             )
             .child(
                 div()
                     .id("chat-scroll")
+                    .track_scroll(&self.chat_scroll)
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -1635,9 +1833,20 @@ impl Workspace {
                     .when(self.chat.is_empty(), |this| {
                         this.child(empty_chat(theme, self.language))
                     })
-                    .children(self.chat.iter().cloned().enumerate().map(|(index, entry)| {
-                        chat_message(index, entry, theme, self.language, cx).into_any_element()
-                    })),
+                    .children({
+                        let last = self.chat.len().saturating_sub(1);
+                        let streaming = self.streaming;
+                        self.chat
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .map(|(index, entry)| {
+                                let waiting = streaming && index == last;
+                                chat_message(index, entry, waiting, theme, self.language, cx)
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    }),
             )
             .when(!self.audit.is_empty(), |this| {
                 this.child(self.audit_panel(theme))
@@ -1691,11 +1900,85 @@ impl Workspace {
                             ),
                     ),
             )
+            .when(self.dropdown == Some(Dropdown::ChatModel), |this| {
+                let provider = &self.settings.provider;
+                this.child(
+                    div()
+                        .absolute()
+                        .top(px(52.0))
+                        .right(px(12.0))
+                        .w(px(230.0))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.dropdown = None;
+                            cx.notify();
+                        }))
+                        .child(dropdown_list(
+                            Dropdown::ChatModel,
+                            provider
+                                .model_options()
+                                .iter()
+                                .map(|model| model.to_string())
+                                .collect(),
+                            provider
+                                .model_options()
+                                .iter()
+                                .position(|model| *model == provider.model),
+                            theme,
+                            cx,
+                        )),
+                )
+            })
+    }
+
+    fn backdrop(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("overlay-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_overlays(cx)),
+            )
+    }
+
+    /// A settings row that expands into a list of options (instead of cycling on click).
+    #[allow(clippy::too_many_arguments)]
+    fn dropdown_row(
+        &self,
+        kind: Dropdown,
+        label: &'static str,
+        value: String,
+        options: Vec<String>,
+        selected: Option<usize>,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let open = self.dropdown == Some(kind);
+        let row = setting_row(
+            label,
+            format!("{value}  {}", if open { "\u{25B4}" } else { "\u{25BE}" }),
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_dropdown(kind, cx)));
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(row)
+            .when(open, |this| {
+                this.child(dropdown_list(kind, options, selected, theme, cx))
+            })
+            .into_any_element()
     }
 
     fn settings_panel(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let provider = &self.settings.provider;
         div()
+            .id("settings-panel")
+            .occlude()
             .absolute()
             .top(px(72.0))
             .left_0()
@@ -1721,12 +2004,8 @@ impl Workspace {
                             .child(self.tr("settings_title")),
                     )
                     .child(
-                        action_button(self.tr("close"), "close-settings", false, theme).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.settings_open = false;
-                                cx.notify();
-                            }),
-                        ),
+                        action_button(self.tr("close"), "close-settings", false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.close_overlays(cx))),
                     ),
             )
             .child(
@@ -1736,8 +2015,20 @@ impl Workspace {
                     .gap_4()
                     .p_4()
                     .child(
-                        setting_row(self.tr("provider"), provider.kind.label(), theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.select_provider(cx))),
+                        self.dropdown_row(
+                            Dropdown::Provider,
+                            self.tr("provider"),
+                            provider.kind.label().to_string(),
+                            ProviderKind::ALL
+                                .iter()
+                                .map(|kind| kind.label().to_string())
+                                .collect(),
+                            ProviderKind::ALL
+                                .iter()
+                                .position(|kind| *kind == provider.kind),
+                            theme,
+                            cx,
+                        ),
                     )
                     .when(
                         matches!(
@@ -1746,15 +2037,23 @@ impl Workspace {
                         ),
                         |this| {
                             this.child(
-                                setting_row(
+                                self.dropdown_row(
+                                    Dropdown::Region,
                                     self.tr("region"),
                                     match provider.region {
                                         Region::China => "China",
                                         Region::Overseas => "Overseas",
-                                    },
+                                    }
+                                    .to_string(),
+                                    vec!["China".to_string(), "Overseas".to_string()],
+                                    Some(if provider.region == Region::China {
+                                        0
+                                    } else {
+                                        1
+                                    }),
                                     theme,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| this.select_region(cx))),
+                                    cx,
+                                ),
                             )
                         },
                     )
@@ -1766,8 +2065,22 @@ impl Workspace {
                     )
                     .when(!provider.model_options().is_empty(), |this| {
                         this.child(
-                            setting_row(self.tr("model"), provider.model.clone(), theme)
-                                .on_click(cx.listener(|this, _, _, cx| this.select_model(cx))),
+                            self.dropdown_row(
+                                Dropdown::Model,
+                                self.tr("model"),
+                                provider.model.clone(),
+                                provider
+                                    .model_options()
+                                    .iter()
+                                    .map(|model| model.to_string())
+                                    .collect(),
+                                provider
+                                    .model_options()
+                                    .iter()
+                                    .position(|model| *model == provider.model),
+                                theme,
+                                cx,
+                            ),
                         )
                     })
                     .when(provider.model_options().is_empty(), |this| {
@@ -1780,8 +2093,20 @@ impl Workspace {
                     })
                     .when(provider.supports_effort(), |this| {
                         this.child(
-                            setting_row(self.tr("effort"), provider.effort.label(), theme)
-                                .on_click(cx.listener(|this, _, _, cx| this.select_effort(cx))),
+                            self.dropdown_row(
+                                Dropdown::Effort,
+                                self.tr("effort"),
+                                provider.effort.label().to_string(),
+                                ReasoningEffort::ALL
+                                    .iter()
+                                    .map(|effort| effort.label().to_string())
+                                    .collect(),
+                                ReasoningEffort::ALL
+                                    .iter()
+                                    .position(|effort| *effort == provider.effort),
+                                theme,
+                                cx,
+                            ),
                         )
                     })
                     .when(provider.kind == ProviderKind::KimiCode, |this| {
@@ -1968,7 +2293,7 @@ impl Workspace {
     }
 
     fn status_bar(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let (line, column) = self.document.read(cx).document().line_col();
+        let (line, column) = self.document.read(cx).cursor_line_col();
         div()
             .flex()
             .items_center()
@@ -2026,6 +2351,7 @@ impl Workspace {
     fn unsaved_panel(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let closing = self.close_confirmation_open;
         div()
+            .occlude()
             .absolute()
             .top(px(94.0))
             .left_0()
@@ -2086,7 +2412,19 @@ impl Workspace {
     }
 
     fn command_palette(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let matches = self.filtered_commands(cx);
+        let selected = self.palette_selected.min(matches.len().saturating_sub(1));
         div()
+            .id("command-palette")
+            .key_context("Palette")
+            .occlude()
+            .on_action(
+                cx.listener(|this, _: &PaletteUp, _, cx| this.move_palette_selection(-1, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PaletteDown, _, cx| this.move_palette_selection(1, cx)),
+            )
+            .on_action(cx.listener(|this, _: &PaletteConfirm, _, cx| this.confirm_palette(cx)))
             .absolute()
             .top(px(72.0))
             .left_0()
@@ -2104,10 +2442,10 @@ impl Workspace {
                     .px_4()
                     .flex()
                     .items_center()
-                    .text_color(theme.faint)
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(self.tr("command_palette")),
+                    .text_color(theme.text)
+                    .child(div().flex_1().child(self.palette_input.clone())),
             )
             .child(
                 div()
@@ -2115,62 +2453,30 @@ impl Workspace {
                     .flex_col()
                     .gap_1()
                     .p_2()
-                    .child(command_row(
-                        self.tr("palette_open"),
-                        "Ctrl O",
-                        PaletteCommand::Open,
-                        true,
-                        theme,
-                        cx,
-                    ))
-                    .child(command_row(
-                        self.tr("palette_save"),
-                        "Ctrl S",
-                        PaletteCommand::Save,
-                        false,
-                        theme,
-                        cx,
-                    ))
-                    .child(command_row(
-                        self.tr("palette_new_chat"),
-                        "Ctrl Shift N",
-                        PaletteCommand::NewChat,
-                        false,
-                        theme,
-                        cx,
-                    ))
-                    .child(command_row(
-                        self.tr("palette_settings"),
-                        "Ctrl ,",
-                        PaletteCommand::Settings,
-                        false,
-                        theme,
-                        cx,
-                    ))
-                    .child(command_row(
-                        self.tr("palette_focus"),
-                        "Ctrl Shift F",
-                        PaletteCommand::Focus,
-                        false,
-                        theme,
-                        cx,
-                    ))
-                    .child(command_row(
-                        self.tr("palette_ai"),
-                        "Ctrl Shift I",
-                        PaletteCommand::Ai,
-                        false,
-                        theme,
-                        cx,
-                    ))
-                    .child(command_row(
-                        self.tr("palette_theme"),
-                        "Ctrl Shift T",
-                        PaletteCommand::Theme,
-                        false,
-                        theme,
-                        cx,
-                    )),
+                    .children(matches.iter().enumerate().map(|(position, index)| {
+                        let (label_key, shortcut, command) = PALETTE_COMMANDS[*index];
+                        command_row(
+                            self.tr(label_key),
+                            shortcut,
+                            command,
+                            position == selected,
+                            theme,
+                            cx,
+                        )
+                        .into_any_element()
+                    }))
+                    .when(matches.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .h(px(38.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .text_sm()
+                                .text_color(theme.faint)
+                                .child(self.tr("no_commands")),
+                        )
+                    }),
             )
     }
 
@@ -2180,10 +2486,13 @@ impl Workspace {
             PaletteCommand::Open => self.open_file_dialog(cx),
             PaletteCommand::Save => self.save_document(false, cx),
             PaletteCommand::NewChat => self.new_chat(cx),
-            PaletteCommand::Settings => self.settings_open = true,
+            PaletteCommand::Settings => self.open_settings(cx),
             PaletteCommand::Focus => self.state.toggle_focus_mode(),
             PaletteCommand::Ai => self.state.toggle_ai(),
             PaletteCommand::Theme => self.state.toggle_theme(),
+        }
+        if !self.settings_open {
+            self.pending_focus = Some(FocusTarget::Document);
         }
         cx.notify();
     }
@@ -2204,6 +2513,25 @@ impl Render for Workspace {
         let theme = Theme::from_mode(self.state.theme);
         self.window_origin_x = window.bounds().origin.x.into();
         self.window_width = window.bounds().size.width.into();
+
+        // While an overlay is open the text editor must not accept keystrokes.
+        let overlay = self.overlay_open();
+        self.document
+            .update(cx, |view, _| view.set_read_only(overlay));
+        if let Some(target) = self.pending_focus.take() {
+            let handle = match target {
+                FocusTarget::Document => self.document.read(cx).focus_handle(cx),
+                FocusTarget::Palette => self.palette_input.read(cx).focus_handle(cx),
+                FocusTarget::Settings => {
+                    if self.settings.provider.model_options().is_empty() {
+                        self.model_input.read(cx).focus_handle(cx)
+                    } else {
+                        self.api_key_input.read(cx).focus_handle(cx)
+                    }
+                }
+            };
+            window.focus(&handle);
+        }
         div()
             .relative()
             .flex()
@@ -2237,6 +2565,7 @@ impl Render for Workspace {
             .when(self.offer_russian, |this| {
                 this.child(self.language_offer(theme, cx))
             })
+            .when(overlay, |this| this.child(self.backdrop(cx)))
             .when(self.state.palette_open, |this| {
                 this.child(self.command_palette(theme, cx))
             })
@@ -2251,6 +2580,61 @@ impl Render for Workspace {
                 |this| this.child(self.unsaved_panel(theme, cx)),
             )
     }
+}
+
+/// Vertical scrollbar for the editor (gpui draws none by itself). Click or drag on the
+/// track to scroll; the thumb follows the mouse wheel because the window is redrawn on scroll.
+fn document_scrollbar(handle: ScrollHandle, theme: Theme) -> gpui::AnyElement {
+    const TRACK_WIDTH: f32 = 12.0;
+    const MIN_THUMB: f32 = 28.0;
+    let viewport = handle.bounds().size.height;
+    let max_offset = handle.max_offset().height;
+    if viewport <= px(1.0) || max_offset <= px(0.5) {
+        return div().into_any_element();
+    }
+    let thumb_height = (viewport * (viewport / (viewport + max_offset))).max(px(MIN_THUMB));
+    let travel = (viewport - thumb_height).max(px(1.0));
+    let progress = (-handle.offset().y / max_offset).clamp(0.0, 1.0);
+    let thumb_top = travel * progress;
+    let scroll_to = move |handle: &ScrollHandle, y: gpui::Pixels| {
+        let origin = handle.bounds().origin.y;
+        let fraction = ((y - origin - thumb_height / 2.0) / travel).clamp(0.0, 1.0);
+        let offset = handle.offset();
+        handle.set_offset(point(offset.x, -(max_offset * fraction)));
+    };
+    let down_handle = handle.clone();
+    let move_handle = handle;
+    div()
+        .id("document-scrollbar")
+        .absolute()
+        .top(px(12.0))
+        .bottom(px(12.0))
+        .right_0()
+        .w(px(TRACK_WIDTH))
+        .cursor_pointer()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, move |event, window, _| {
+            scroll_to(&down_handle, event.position.y);
+            window.refresh();
+        })
+        .on_mouse_move(move |event, window, _| {
+            if event.pressed_button == Some(MouseButton::Left) {
+                scroll_to(&move_handle, event.position.y);
+                window.refresh();
+            }
+        })
+        .child(
+            div()
+                .absolute()
+                .top(thumb_top)
+                .right(px(2.0))
+                .w(px(8.0))
+                .h(thumb_height)
+                .rounded_full()
+                .bg(gpui::Hsla::from(theme.muted).opacity(0.35))
+                .hover(|style| style.bg(gpui::Hsla::from(theme.muted).opacity(0.6))),
+        )
+        .into_any_element()
 }
 
 fn logo(theme: Theme) -> impl IntoElement {
@@ -2363,6 +2747,7 @@ fn empty_chat(theme: Theme, language: Language) -> impl IntoElement {
 fn chat_message(
     index: usize,
     entry: ChatEntry,
+    waiting: bool,
     theme: Theme,
     language: Language,
     cx: &mut Context<Workspace>,
@@ -2458,12 +2843,66 @@ fn chat_message(
                 .text_sm()
                 .line_height(px(21.0))
                 .text_color(theme.text)
-                .child(if entry.content.is_empty() {
+                .child(if !entry.content.is_empty() {
+                    entry.content
+                } else if waiting {
                     tr(language, "thinking").into()
                 } else {
-                    entry.content
+                    "(no response)".into()
                 }),
         )
+}
+
+fn dropdown_list(
+    kind: Dropdown,
+    options: Vec<String>,
+    selected: Option<usize>,
+    theme: Theme,
+    cx: &mut Context<Workspace>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(("dropdown-list", kind as usize))
+        .occlude()
+        .flex()
+        .flex_col()
+        .p_1()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.raised)
+        .shadow_lg()
+        .max_h(px(260.0))
+        .overflow_y_scroll()
+        .children(options.into_iter().enumerate().map(|(index, option)| {
+            let is_selected = selected == Some(index);
+            div()
+                .id((
+                    match kind {
+                        Dropdown::Provider => "dd-provider",
+                        Dropdown::Region => "dd-region",
+                        Dropdown::Model => "dd-model",
+                        Dropdown::Effort => "dd-effort",
+                        Dropdown::ChatModel => "dd-chat-model",
+                    },
+                    index,
+                ))
+                .flex()
+                .items_center()
+                .h(px(30.0))
+                .px_3()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .text_color(if is_selected {
+                    theme.accent
+                } else {
+                    theme.text
+                })
+                .when(is_selected, |this| this.bg(theme.accent_soft))
+                .hover(|style| style.bg(theme.hover))
+                .child(option)
+                .on_click(cx.listener(move |this, _, _, cx| this.apply_dropdown(kind, index, cx)))
+        }))
 }
 
 fn setting_row(
