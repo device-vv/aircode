@@ -11,11 +11,16 @@ aircode-ai.workspace = true
 aircode-core.workspace = true
 aircode-editor.workspace = true
 aircode-i18n.workspace = true
+aircode-history.workspace = true
 aircode-project.workspace = true
 aircode-syntax.workspace = true
+aircode-terminal.workspace = true
 gpui.workspace = true
 raw-window-handle = "0.6.2"
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 unicode-segmentation = "1.12.0"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

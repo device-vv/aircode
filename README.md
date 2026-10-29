@@ -9,7 +9,7 @@
 
 ## English
 
-AIRcode combines a native GPUI editor, a project explorer, Tree-sitter syntax highlighting, and direct streaming AI integrations. Version **0.3.0** is a working Windows x86_64 portable release.
+AIRcode combines a native GPUI editor, a project explorer, Tree-sitter syntax highlighting, and direct streaming AI integrations. Version **0.3.1** is a Windows x86_64 portable release.
 
 No Electron, embedded browser, CLI agent, or protocol-translating proxy is used. API keys stay in the operating system's credential store.
 
@@ -19,22 +19,25 @@ Download `aircode-windows-x86_64.zip` from the [latest GitHub Release](https://g
 
 The executable is portable and currently **unsigned**, so Windows SmartScreen may ask for confirmation. Verify the SHA256 file published beside the package.
 
-### Implemented in v0.3.0
+### Features in v0.3.1
 
 - Open a complete project folder with a lazy file tree and filesystem change watching.
 - Open, edit, and save UTF-8 files, with Unicode selection, Windows IME input, clipboard, undo/redo, and unsaved-change confirmation.
-- Incremental Tree-sitter highlighting for Rust, Python, JavaScript, TypeScript, Go, C, C++, Java, C#, HTML, CSS, JSON, TOML, YAML, and Markdown. Only visible lines are rendered.
+- Tree-sitter highlighting for Rust, Python, Dart/Flutter, JavaScript, TypeScript, Go, C, C++, Java, C#, HTML, CSS, JSON, TOML, YAML, and Markdown. Only visible lines are rendered. Project markers distinguish Rust, Python, Dart, and Flutter projects; syntax highlighting does not imply LSP support.
+- File tabs and an integrated project terminal. The terminal uses the system shell; use Ctrl+Shift+V (Command+V on macOS) to paste.
+- Optional AI inline completion: enable it in AI settings, press Tab to accept a suggestion or Escape to dismiss it. When enabled, code around the cursor is sent to the selected provider and may incur charges.
+- Chat and draft are saved per project. Clearing a conversation requires confirmation. Large conversations may be sent to the configured provider for automatic summarization; the visible history remains available.
 - Project, editor, and agent panels with draggable splitters and saved widths.
 - Custom AIRcode title bar and application icon; working minimize, maximize/restore, and close controls. No console window on Windows.
 - Non-blocking file/folder dialogs and title-bar dragging across monitors, with repeated Windows window-state stress validation.
 - English and Russian interfaces. English is the default; Russian-system users are offered a one-time language switch.
 - Streaming AI chat with collapsible reasoning, cancellation, message copying, and context menus for cut/copy/paste/select all.
 - Optional document or selection context, limited to 200 KB per request.
-- Project agent tools: list, read, search, write, create directories, move, delete, and run commands. The agent is limited to eight tool steps per session.
+- Project agent tools: list, read, search, write, create directories, move, delete, and run commands. The agent is limited to eight tool steps per user message; bounded results explicitly identify incomplete project inspection.
 - Three permission modes: **Ask every action**, **Ask important only**, and **Full access**. Approval includes the tool arguments and a diff for file writes. An activity log records tool calls and results.
 - Light and dark themes, native Kimi Code support, and custom OpenAI-compatible providers.
 
-Not included yet: LSP, debugging/DAP, Git operations, an integrated terminal, multi-tab editing, and signed installers. Files larger than 16 MiB are rejected. macOS and Linux remain compile targets, not published or runtime-validated releases.
+Not included yet: LSP, debugging/DAP, Git operations, and signed installers. Files larger than 16 MiB are rejected. macOS and Linux remain compile targets, not published or runtime-validated releases.
 
 ### Agent permissions and safety
 
@@ -68,7 +71,7 @@ Available model IDs:
 - `kimi-for-coding`
 - `kimi-for-coding-highspeed`
 
-K3.1 Pro always uses thinking. `low`, `high`, and `max` reasoning effort levels are available; `high` is the default. Changing the model or effort starts a new session. Model availability and context limits depend on the membership tier.
+K3.1 Pro always uses thinking. `low`, `high`, and `max` reasoning effort levels are available; `high` is the default. Changing the provider, model, or effort stops an active turn but preserves the visible chat. Model availability and context limits depend on the membership tier.
 
 Setup:
 
@@ -95,7 +98,7 @@ The integration uses native HTTP/SSE with an `AIRcode/<version>` User-Agent. Pro
 - API keys are saved in Windows Credential Manager or the equivalent OS backend.
 - Settings contain only provider, interface, panel, permission, and context preferences.
 - Keys are excluded from logs, errors, Git, and release archives.
-- Nothing is sent to a provider until you explicitly send a message.
+- Data is sent when you send a message, when a large project history is summarized, or when you enable AI inline completion and type in the editor.
 - Document context can be disabled in Settings.
 
 ### Build from source
@@ -158,7 +161,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 ## Русский
 
-AIRcode объединяет нативный GPUI-редактор, дерево проекта, подсветку Tree-sitter и прямые потоковые ИИ-интеграции. Версия **0.3.0** — рабочий portable-релиз для Windows x86_64.
+AIRcode объединяет нативный GPUI-редактор, дерево проекта, подсветку Tree-sitter и прямые потоковые ИИ-интеграции. Версия **0.3.1** — portable-релиз для Windows x86_64.
 
 Без Electron, встроенного браузера, CLI-агентов и прокси для преобразования протоколов. API-ключи хранятся в системном хранилище ОС.
 
@@ -168,11 +171,14 @@ AIRcode объединяет нативный GPUI-редактор, дерев�
 
 Приложение portable и пока **не имеет цифровой подписи**, поэтому Windows SmartScreen может запросить подтверждение. Проверьте SHA256-файл рядом с пакетом.
 
-### Реализовано в v0.3.0
+### Возможности v0.3.1
 
 - Открытие всей папки проекта, ленивое дерево файлов и отслеживание изменений на диске.
 - Открытие, редактирование и сохранение UTF-8 файлов, Unicode-выделение, Windows IME, буфер обмена, undo/redo и подтверждение при потере изменений.
-- Инкрементальная подсветка Tree-sitter для Rust, Python, JavaScript, TypeScript, Go, C, C++, Java, C#, HTML, CSS, JSON, TOML, YAML и Markdown. Отрисовываются только видимые строки.
+- Подсветка Tree-sitter для Rust, Python, Dart/Flutter, JavaScript, TypeScript, Go, C, C++, Java, C#, HTML, CSS, JSON, TOML, YAML и Markdown. Отрисовываются только видимые строки. Маркеры проекта различают Rust, Python, Dart и Flutter; наличие подсветки не означает поддержку LSP.
+- Вкладки файлов и встроенный терминал проекта на системной оболочке. Вставка: Ctrl+Shift+V, на macOS — Command+V.
+- Подсказки кода ИИ можно включить в настройках: Tab принимает подсказку, Escape отменяет её. Код вокруг курсора отправляется выбранному провайдеру; запросы могут быть платными.
+- Чат и черновик сохраняются отдельно для каждого проекта. Полная очистка требует подтверждения. Большая переписка может автоматически отправляться провайдеру для сжатия; видимая история остаётся доступной.
 - Панели проекта, редактора и агента с изменяемой шириной и сохранением размеров.
 - Фирменная строка заголовка и иконка, рабочие сворачивание, разворачивание/восстановление и закрытие. Консоль Windows не открывается.
 - Неблокирующие диалоги файлов/папок и перетаскивание окна между мониторами; повторные стресс-проверки состояния окна Windows.
@@ -183,7 +189,7 @@ AIRcode объединяет нативный GPUI-редактор, дерев�
 - Три режима: **Спрашивать каждое действие**, **Спрашивать только важное**, **Полный доступ**. Перед записью показываются аргументы и diff. Журнал содержит вызовы и результаты.
 - Светлая и тёмная темы, нативный Kimi Code и пользовательские OpenAI-совместимые провайдеры.
 
-Пока не входят: LSP, отладка/DAP, Git, встроенный терминал, несколько вкладок и подписанные установщики. Файлы больше 16 МиБ отклоняются. macOS и Linux остаются целями компиляции, но не опубликованными и не проверенными в работе релизами.
+Пока не входят: LSP, отладка/DAP, Git и подписанные установщики. Файлы больше 16 МиБ отклоняются. macOS и Linux остаются целями компиляции, но не опубликованными и не проверенными в работе релизами.
 
 ### Разрешения и безопасность агента
 
@@ -217,7 +223,7 @@ AIRcode напрямую использует официальный Kimi Code C
 - `kimi-for-coding`
 - `kimi-for-coding-highspeed`
 
-K3.1 Pro всегда использует thinking. Доступны `low`, `high` и `max`, по умолчанию — `high`. Смена модели или effort начинает новую сессию. Доступность моделей и лимит контекста зависят от подписки.
+K3.1 Pro всегда использует thinking. Доступны `low`, `high` и `max`, по умолчанию — `high`. При смене провайдера, модели или effort активный ответ останавливается, а видимая переписка сохраняется. Доступность моделей и лимит контекста зависят от подписки.
 
 Настройка:
 
@@ -244,7 +250,7 @@ K3.1 Pro всегда использует thinking. Доступны `low`, `hi
 - API-ключи сохраняются в Windows Credential Manager или эквивалентном backend ОС.
 - В настройках находятся только провайдер, интерфейс, панели, разрешения и контекст.
 - Ключи не попадают в логи, ошибки, Git и архивы релиза.
-- Ничего не отправляется провайдеру без явной отправки сообщения.
+- Данные отправляются провайдеру при отправке сообщения, при сжатии большой истории проекта или при вводе кода с включёнными подсказками ИИ.
 - Контекст документа можно отключить в настройках.
 
 ### Сборка из исходников

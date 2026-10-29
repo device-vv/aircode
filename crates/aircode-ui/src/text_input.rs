@@ -86,6 +86,16 @@ impl TextInput {
         &self.content
     }
 
+    #[cfg(test)]
+    pub fn placeholder(&self) -> &str {
+        &self.placeholder
+    }
+
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>) {
+        self.placeholder = placeholder.into();
+        self.last_layout = None;
+    }
+
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = text.into();
         self.selected_range = self.content.len()..self.content.len();
@@ -400,6 +410,9 @@ impl EntityInputHandler for TextInput {
         _: &mut Context<Self>,
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
+        if range.start > range.end {
+            return None;
+        }
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.content[range].to_string())
     }
@@ -456,14 +469,25 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let start = range_utf16
+            .as_ref()
+            .map(|range| self.range_from_utf16(range))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone())
+            .start;
         self.replace_text_in_range(range_utf16, new_text, window, cx);
-        if !new_text.is_empty() {
-            let start = self.selected_range.start.saturating_sub(new_text.len());
-            self.marked_range = Some(start..start + new_text.len());
+        let inserted = self.selected_range.start.saturating_sub(start);
+        if inserted > 0 {
+            self.marked_range = Some(start..start + inserted);
         }
         if let Some(selection) = new_selected_range_utf16 {
-            let selection = self.range_from_utf16(&selection);
-            self.selected_range = selection;
+            // The IME reports offsets relative to the composed text.
+            let composed = &self.content[start..start + inserted];
+            let from = crate::document::utf16_to_byte(composed, selection.start);
+            let to = crate::document::utf16_to_byte(composed, selection.end);
+            if from <= to {
+                self.selected_range = start + from..start + to;
+            }
         }
         cx.notify();
     }

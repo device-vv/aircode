@@ -1,4 +1,6 @@
+mod agent_turn;
 mod document;
+mod terminal_view;
 mod text_input;
 mod theme;
 mod workspace;

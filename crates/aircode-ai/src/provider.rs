@@ -221,12 +221,39 @@ pub enum MessageRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<AssistantToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssistantToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: ToolCallKind,
+    pub function: AssistantToolFunction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallKind {
+    Function,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssistantToolFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 impl ChatMessage {
@@ -234,6 +261,9 @@ impl ChatMessage {
         Self {
             role: MessageRole::User,
             content: content.into(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -241,6 +271,53 @@ impl ChatMessage {
         Self {
             role: MessageRole::Assistant,
             content: content.into(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::System,
+            content: content.into(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_tool_calls(
+        content: impl Into<String>,
+        reasoning_content: String,
+        calls: &[ToolCall],
+    ) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            reasoning_content: Some(reasoning_content),
+            tool_calls: calls
+                .iter()
+                .map(|call| AssistantToolCall {
+                    id: call.id.clone(),
+                    kind: ToolCallKind::Function,
+                    function: AssistantToolFunction {
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    },
+                })
+                .collect(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: content.into(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
         }
     }
 }
@@ -316,5 +393,30 @@ mod tests {
         assert!(body.get("reasoning_effort").is_none());
         config.base_url = "https://routerai.ru/api/v1".into();
         assert_eq!(config.kind, ProviderKind::DeepSeek);
+    }
+
+    #[test]
+    fn tool_followup_uses_openai_messages_and_preserves_kimi_reasoning() {
+        let calls = vec![ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: "{\"path\":\"src/lib.rs\"}".into(),
+        }];
+        let messages = vec![
+            ChatMessage::assistant_tool_calls("Checking", "Kimi reasoning".into(), &calls),
+            ChatMessage::tool_result("call-1", "file contents"),
+        ];
+        let body = ProviderConfig::default().request_body(&messages);
+
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(body["messages"][0]["reasoning_content"], "Kimi reasoning");
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][1]["tool_call_id"], "call-1");
+        assert!(body["messages"][1].get("reasoning_content").is_none());
     }
 }

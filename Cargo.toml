@@ -6,14 +6,16 @@ members = [
     "crates/aircode-core",
     "crates/aircode-editor",
     "crates/aircode-i18n",
+    "crates/aircode-history",
     "crates/aircode-project",
     "crates/aircode-syntax",
+    "crates/aircode-terminal",
     "crates/aircode-ui",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.90"
@@ -24,8 +26,10 @@ aircode-ai = { path = "crates/aircode-ai" }
 aircode-core = { path = "crates/aircode-core" }
 aircode-editor = { path = "crates/aircode-editor" }
 aircode-i18n = { path = "crates/aircode-i18n" }
+aircode-history = { path = "crates/aircode-history" }
 aircode-project = { path = "crates/aircode-project" }
 aircode-syntax = { path = "crates/aircode-syntax" }
+aircode-terminal = { path = "crates/aircode-terminal" }
 aircode-ui = { path = "crates/aircode-ui" }
 futures-util = "0.3.31"
 gpui = "0.2.2"

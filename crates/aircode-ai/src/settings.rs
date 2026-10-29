@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -10,6 +13,7 @@ use crate::{AiError, ProviderConfig};
 pub struct AppSettings {
     pub provider: ProviderConfig,
     pub include_document: bool,
+    pub inline_completion: bool,
     pub language: String,
     pub locale_offer_dismissed: bool,
     pub left_width: f32,
@@ -22,6 +26,7 @@ impl Default for AppSettings {
         Self {
             provider: ProviderConfig::default(),
             include_document: true,
+            inline_completion: false,
             language: "en".into(),
             locale_offer_dismissed: false,
             left_width: 260.0,
@@ -49,6 +54,10 @@ impl SettingsStore {
         Self { path: path.into() }
     }
 
+    pub fn config_dir(&self) -> Option<&Path> {
+        self.path.parent()
+    }
+
     pub fn load(&self) -> Result<AppSettings, AiError> {
         if !self.path.exists() {
             return Ok(AppSettings::default());
@@ -74,6 +83,12 @@ mod tests {
     use crate::{ProviderKind, ReasoningEffort};
 
     #[test]
+    fn existing_settings_do_not_enable_inline_completion() {
+        let settings: AppSettings = toml::from_str("language = 'ru'").unwrap();
+        assert!(!settings.inline_completion);
+    }
+
+    #[test]
     fn settings_round_trip_contains_no_api_key_field() {
         let path = std::env::temp_dir().join(format!(
             "aircode-settings-test-{}/settings.toml",
@@ -83,6 +98,7 @@ mod tests {
         let settings = AppSettings {
             provider: ProviderConfig::new(ProviderKind::KimiCode),
             include_document: false,
+            inline_completion: true,
             ..AppSettings::default()
         };
 
@@ -93,6 +109,7 @@ mod tests {
         assert_eq!(loaded.provider.model, "k3.1-pro");
         assert_eq!(loaded.provider.effort, ReasoningEffort::High);
         assert!(!loaded.include_document);
+        assert!(loaded.inline_completion);
         assert!(!raw.contains("api_key"));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

@@ -13,8 +13,8 @@ const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 pub enum StreamEvent {
     ReasoningDelta(String),
     ContentDelta(String),
-    ToolCall(ToolCall),
-    ToolResult(String),
+    ToolCalls(Vec<ToolCall>),
+    ToolResult { call_id: String, result: String },
     Usage(serde_json::Value),
     Error(String),
     Done,
@@ -54,6 +54,8 @@ impl AiClient {
         let client = reqwest::Client::builder()
             .user_agent(concat!("AIRcode/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
+            // Bound idle reads while allowing long, actively streaming responses.
+            .read_timeout(Duration::from_secs(120))
             .build()
             .map_err(|error| AiError::Transport(error.to_string()))?;
         Ok(Self { client })
@@ -107,10 +109,11 @@ impl AiClient {
 
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "No error details returned".into());
+            let message = tokio::select! {
+                _ = cancel.cancelled() => return Err(AiError::Cancelled),
+                text = response.text() => text
+                    .unwrap_or_else(|_| "No error details returned".into()),
+            };
             let message = message.replace(api_key.expose(), "[REDACTED]");
             let message = match status.as_u16() {
                 400 if config.kind == crate::ProviderKind::KimiCode => format!(
@@ -132,49 +135,96 @@ impl AiClient {
         let mut tool_calls = HashMap::new();
         let mut stream = response.bytes_stream();
         let mut received = 0usize;
+        let mut finished = false;
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => return Err(AiError::Cancelled),
                 chunk = stream.next() => chunk,
             };
-            let Some(chunk) = chunk else {
-                break;
+            let (batch, closed) = match chunk {
+                Some(chunk) => {
+                    let chunk = chunk.map_err(|error| AiError::Transport(error.to_string()))?;
+                    received += chunk.len();
+                    if received > MAX_STREAM_BYTES {
+                        return Err(AiError::Protocol("Response exceeded 64 MiB".into()));
+                    }
+                    (decoder.push(&chunk).map_err(AiError::Protocol)?, false)
+                }
+                None => (decoder.finish().map_err(AiError::Protocol)?, true),
             };
-            let chunk = chunk.map_err(|error| AiError::Transport(error.to_string()))?;
-            received += chunk.len();
-            if received > MAX_STREAM_BYTES {
-                return Err(AiError::Protocol("Response exceeded 64 MiB".into()));
-            }
-            for data in decoder.push(&chunk).map_err(AiError::Protocol)? {
-                if data == "[DONE]" {
-                    emit_tool_calls(&mut tool_calls, &events);
+            for data in batch {
+                if forward_event(
+                    &data,
+                    &events,
+                    &mut finished,
+                    &mut tool_calls,
+                    api_key.expose(),
+                )? {
+                    emit_tool_calls(&mut tool_calls, &events)?;
                     let _ = events.send(StreamEvent::Done);
                     return Ok(());
                 }
-                let chunk: ChatCompletionChunk = serde_json::from_str(&data)
-                    .map_err(|error| AiError::Protocol(error.to_string()))?;
-                if let Some(usage) = chunk.usage {
-                    let _ = events.send(StreamEvent::Usage(usage));
-                }
-                for choice in chunk.choices {
-                    merge_tool_calls(&mut tool_calls, choice.delta.tool_calls);
-                    if let Some(reasoning) = choice.delta.reasoning_content
-                        && !reasoning.is_empty()
-                    {
-                        let _ = events.send(StreamEvent::ReasoningDelta(reasoning));
-                    }
-                    if let Some(content) = choice.delta.content
-                        && !content.is_empty()
-                    {
-                        let _ = events.send(StreamEvent::ContentDelta(content));
-                    }
-                }
+            }
+            if closed {
+                break;
             }
         }
-        emit_tool_calls(&mut tool_calls, &events);
+        if !finished {
+            return Err(AiError::Protocol(
+                "The stream ended before the response was complete".into(),
+            ));
+        }
+        emit_tool_calls(&mut tool_calls, &events)?;
         let _ = events.send(StreamEvent::Done);
         Ok(())
     }
+}
+
+/// Forward one SSE payload. Returns true for the terminal `[DONE]` sentinel.
+fn forward_event(
+    data: &str,
+    events: &mpsc::UnboundedSender<StreamEvent>,
+    finished: &mut bool,
+    tool_calls: &mut HashMap<usize, ToolCall>,
+    api_key: &str,
+) -> Result<bool, AiError> {
+    if data.trim() == "[DONE]" {
+        *finished = true;
+        return Ok(true);
+    }
+    let chunk: ChatCompletionChunk =
+        serde_json::from_str(data).map_err(|error| AiError::Protocol(error.to_string()))?;
+    if let Some(error) = chunk.error {
+        let message = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| error.to_string());
+        return Err(AiError::Protocol(message.replace(api_key, "[REDACTED]")));
+    }
+    if let Some(usage) = chunk.usage {
+        let _ = events.send(StreamEvent::Usage(usage));
+    }
+    for choice in chunk.choices {
+        if choice.finish_reason.is_some() {
+            *finished = true;
+        }
+        let Some(delta) = choice.delta else {
+            continue;
+        };
+        merge_tool_calls(tool_calls, delta.tool_calls);
+        if let Some(reasoning) = delta.reasoning_content
+            && !reasoning.is_empty()
+        {
+            let _ = events.send(StreamEvent::ReasoningDelta(reasoning));
+        }
+        if let Some(content) = delta.content
+            && !content.is_empty()
+        {
+            let _ = events.send(StreamEvent::ContentDelta(content));
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Deserialize)]
@@ -182,11 +232,13 @@ struct ChatCompletionChunk {
     #[serde(default)]
     choices: Vec<Choice>,
     usage: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct Choice {
-    delta: Delta,
+    delta: Option<Delta>,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -207,6 +259,7 @@ struct ToolCallDelta {
 #[derive(Deserialize)]
 struct ToolFunctionDelta {
     name: Option<String>,
+    #[serde(default)]
     arguments: String,
 }
 
@@ -230,13 +283,43 @@ fn merge_tool_calls(map: &mut HashMap<usize, ToolCall>, deltas: Vec<ToolCallDelt
 fn emit_tool_calls(
     map: &mut HashMap<usize, ToolCall>,
     events: &mpsc::UnboundedSender<StreamEvent>,
-) {
+) -> Result<(), AiError> {
     let mut calls = map.drain().collect::<Vec<_>>();
     calls.sort_by_key(|(index, _)| *index);
-    for (_, call) in calls {
-        if !call.name.is_empty() {
-            let _ = events.send(StreamEvent::ToolCall(call));
-        }
+    let calls = calls.into_iter().map(|(_, call)| call).collect::<Vec<_>>();
+    if calls
+        .iter()
+        .any(|call| call.id.trim().is_empty() || call.name.trim().is_empty())
+    {
+        return Err(AiError::Protocol(
+            "A tool call is missing its id or function name".into(),
+        ));
+    }
+    if !calls.is_empty() {
+        let _ = events.send(StreamEvent::ToolCalls(calls));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn assert_tool_call_protocol_errors() {
+    let mut calls = HashMap::from([(
+        0,
+        ToolCall {
+            id: String::new(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        },
+    )]);
+    let (sender, _) = mpsc::unbounded_channel();
+    assert!(emit_tool_calls(&mut calls, &sender).is_err());
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    #[test]
+    fn incomplete_tool_calls_are_rejected() {
+        super::assert_tool_call_protocol_errors();
     }
 }
 
@@ -378,11 +461,64 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                StreamEvent::ToolCall(ToolCall {
+                StreamEvent::ToolCalls(vec![ToolCall {
                     id: "call-1".into(),
                     name: "write_file".into(),
                     arguments: "{\"path\":\"src/main.rs\",\"content\":\"fn main() {}\"}".into(),
-                }),
+                }]),
+                StreamEvent::Done,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn batches_multiple_tool_calls_in_index_order_with_reasoning() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Keep this\",\"tool_calls\":[{\"index\":1,\"id\":\"call-2\",\"function\":{\"name\":\"search_text\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"read_file\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"src/lib.rs\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, _) = server("200 OK", "text/event-stream", body, 2).await;
+        let config = ProviderConfig {
+            base_url,
+            ..ProviderConfig::default()
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        AiClient::new()
+            .unwrap()
+            .stream_chat_with_tools(
+                &config,
+                &key(),
+                &[],
+                Some(serde_json::json!([])),
+                CancellationToken::new(),
+                sender,
+            )
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ReasoningDelta("Keep this".into()),
+                StreamEvent::ToolCalls(vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: "{\"path\":\"src/lib.rs\"}".into(),
+                    },
+                    ToolCall {
+                        id: "call-2".into(),
+                        name: "search_text".into(),
+                        arguments: "{}".into(),
+                    },
+                ]),
                 StreamEvent::Done,
             ]
         );
@@ -436,6 +572,75 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(AiError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn eof_flushes_a_complete_final_event() {
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"}]}\n";
+        let (base_url, _) = server("200 OK", "text/event-stream", body, 5).await;
+        let config = ProviderConfig {
+            base_url,
+            ..ProviderConfig::default()
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        AiClient::new()
+            .unwrap()
+            .stream_chat(&config, &key(), &[], CancellationToken::new(), sender)
+            .await
+            .unwrap();
+
+        let events = receiver.recv().await.unwrap();
+        assert_eq!(events, StreamEvent::ContentDelta("tail".into()));
+        assert_eq!(receiver.recv().await.unwrap(), StreamEvent::Done);
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_is_not_reported_as_done() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let (base_url, _) = server("200 OK", "text/event-stream", body, 1024).await;
+        let config = ProviderConfig {
+            base_url,
+            ..ProviderConfig::default()
+        };
+        let (sender, _) = mpsc::unbounded_channel();
+
+        let error = AiClient::new()
+            .unwrap()
+            .stream_chat(&config, &key(), &[], CancellationToken::new(), sender)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("before the response was complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn in_stream_errors_are_surfaced_and_redacted() {
+        let body = concat!(
+            "data: {\"error\":{\"message\":\"bad key sk-test-secret\"}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, _) = server("200 OK", "text/event-stream", body, 1024).await;
+        let config = ProviderConfig {
+            base_url,
+            ..ProviderConfig::default()
+        };
+        let (sender, _) = mpsc::unbounded_channel();
+
+        let error = AiClient::new()
+            .unwrap()
+            .stream_chat(&config, &key(), &[], CancellationToken::new(), sender)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("[REDACTED]"));
+        assert!(!error.contains("sk-test-secret"));
     }
 
     #[tokio::test]

@@ -1,12 +1,14 @@
+use std::sync::Arc;
 use std::{collections::HashMap, ops::Range};
+use tokio_util::sync::CancellationToken;
 
 use aircode_editor::Document;
 use aircode_i18n::{Language as UiLanguage, tr};
 use aircode_syntax::{HighlightKind, Language, SyntaxHighlighter};
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IsZero, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ScrollHandle, ShapedLine, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
     fill, point, prelude::*, px, relative, rgba, size,
 };
@@ -20,6 +22,10 @@ actions!(
         Right,
         Up,
         Down,
+        PageUp,
+        PageDown,
+        DocumentStart,
+        DocumentEnd,
         SelectLeft,
         SelectRight,
         SelectAll,
@@ -32,6 +38,7 @@ actions!(
         Redo,
         InsertNewline,
         InsertTab,
+        DismissCompletion,
         ShowCharacterPalette,
     ]
 );
@@ -44,6 +51,10 @@ pub fn register_actions(cx: &mut App) {
         KeyBinding::new("right", Right, Some("Document")),
         KeyBinding::new("up", Up, Some("Document")),
         KeyBinding::new("down", Down, Some("Document")),
+        KeyBinding::new("pageup", PageUp, Some("Document")),
+        KeyBinding::new("pagedown", PageDown, Some("Document")),
+        KeyBinding::new("secondary-home", DocumentStart, Some("Document")),
+        KeyBinding::new("secondary-end", DocumentEnd, Some("Document")),
         KeyBinding::new("shift-left", SelectLeft, Some("Document")),
         KeyBinding::new("shift-right", SelectRight, Some("Document")),
         KeyBinding::new("secondary-a", SelectAll, Some("Document")),
@@ -56,9 +67,13 @@ pub fn register_actions(cx: &mut App) {
         KeyBinding::new("secondary-y", Redo, Some("Document")),
         KeyBinding::new("enter", InsertNewline, Some("Document")),
         KeyBinding::new("tab", InsertTab, Some("Document")),
+        KeyBinding::new("escape", DismissCompletion, Some("Document")),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("Document")),
     ]);
 }
+
+pub(crate) const LINE_HEIGHT: f32 = 22.0;
+const TEXT_PADDING: f32 = 24.0;
 
 pub struct DocumentView {
     document: Document,
@@ -72,6 +87,22 @@ pub struct DocumentView {
     context_menu_open: bool,
     syntax: Option<SyntaxHighlighter>,
     scroll_handle: ScrollHandle,
+    read_only: bool,
+    reveal_cursor: bool,
+    max_line_columns: usize,
+    last_scale_factor: f32,
+    revision: u64,
+    completion: Option<(u64, usize, String)>,
+    completion_engine: Option<CompletionEngine>,
+    completion_cancel: Option<CancellationToken>,
+    completion_blur: Option<gpui::Subscription>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CompletionEngine {
+    pub runtime: Arc<tokio::runtime::Runtime>,
+    pub client: Arc<aircode_ai::AiClient>,
+    pub config: aircode_ai::ProviderConfig,
 }
 
 impl DocumentView {
@@ -88,7 +119,123 @@ impl DocumentView {
             context_menu_open: false,
             syntax: None,
             scroll_handle: ScrollHandle::new(),
+            read_only: false,
+            reveal_cursor: false,
+            max_line_columns: 40,
+            last_scale_factor: 0.0,
+            revision: 0,
+            completion: None,
+            completion_engine: None,
+            completion_cancel: None,
+            completion_blur: None,
         }
+    }
+
+    pub fn scroll_handle(&self) -> ScrollHandle {
+        self.scroll_handle.clone()
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        if read_only {
+            self.cancel_completion();
+        }
+    }
+
+    pub(crate) fn configure_completion(&mut self, engine: Option<CompletionEngine>) {
+        if self.completion_engine.as_ref().map(|engine| &engine.config)
+            == engine.as_ref().map(|engine| &engine.config)
+        {
+            return;
+        }
+        self.cancel_completion();
+        self.completion_engine = engine;
+    }
+
+    fn cancel_completion(&mut self) {
+        if let Some(cancel) = self.completion_cancel.take() {
+            cancel.cancel();
+        }
+        self.completion = None;
+    }
+
+    fn schedule_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_completion();
+        let Some(engine) = self.completion_engine.clone() else {
+            return;
+        };
+        let Some((revision, cursor, messages)) = self.completion_context() else {
+            return;
+        };
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+        if self.completion_blur.is_none() {
+            let focus = self.focus_handle.clone();
+            self.completion_blur = Some(cx.on_blur(&focus, window, |view, _, cx| {
+                view.revision = view.revision.wrapping_add(1);
+                view.cancel_completion();
+                cx.notify();
+            }));
+        }
+        let cancel = CancellationToken::new();
+        self.completion_cancel = Some(cancel.clone());
+        cx.spawn_in(window, async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(650))
+                .await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            let still_focused = view
+                .update_in(cx, |view, window, _| {
+                    view.focus_handle.is_focused(window)
+                        && view.revision == revision
+                        && !view.read_only
+                })
+                .unwrap_or(false);
+            if !still_focused {
+                return;
+            }
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let request_cancel = cancel.clone();
+            engine.runtime.spawn(async move {
+                let result = match aircode_ai::CredentialStore::load(&engine.config.credential_id())
+                {
+                    Ok(Some(key)) => aircode_ai::request_completion(
+                        &engine.client,
+                        &engine.config,
+                        &key,
+                        &messages,
+                        request_cancel,
+                    )
+                    .await
+                    .ok(),
+                    _ => None,
+                };
+                let _ = sender.send(result);
+            });
+            if let Some(result) = receiver.recv().await
+                && !cancel.is_cancelled()
+            {
+                let _ = view.update_in(cx, |view, window, cx| {
+                    if view.revision == revision && view.document.selection() == (cursor..cursor) {
+                        view.completion_cancel = None;
+                        if let Some(text) = result
+                            && view.focus_handle.is_focused(window)
+                        {
+                            view.set_completion(revision, cursor, &text, cx);
+                        }
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let (line, column) = self.document.line_col_at(self.cursor_offset());
+        (line + 1, column + 1)
     }
 
     pub fn document(&self) -> &Document {
@@ -96,21 +243,110 @@ impl DocumentView {
     }
 
     pub fn document_mut(&mut self) -> &mut Document {
+        self.revision = self.revision.wrapping_add(1);
+        self.cancel_completion();
         &mut self.document
     }
 
-    pub fn set_document(&mut self, document: Document, cx: &mut Context<Self>) {
-        self.syntax = document
+    pub fn completion_context(&self) -> Option<(u64, usize, Vec<aircode_ai::ChatMessage>)> {
+        let selection = self.document.selection();
+        if self.read_only || self.marked_range.is_some() || !selection.is_empty() {
+            return None;
+        }
+        let cursor = selection.start;
+        let line = self.document.line_of_offset(cursor);
+        if cursor != self.document.line_range(line).end {
+            return None;
+        }
+        let language = self
+            .detected_language()
+            .map_or("text", |language| language.label());
+        let messages = aircode_ai::completion_messages(self.document.text(), cursor, language)?;
+        Some((self.revision, cursor, messages))
+    }
+
+    pub fn set_completion(
+        &mut self,
+        revision: u64,
+        cursor: usize,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only
+            || self.marked_range.is_some()
+            || self.revision != revision
+            || self.document.selection() != (cursor..cursor)
+        {
+            return;
+        }
+        let line = text.lines().next().unwrap_or("");
+        if !line.is_empty() && !line.starts_with("```") {
+            let mut end = line.len().min(4096);
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.completion = Some((revision, cursor, line[..end].to_owned()));
+            cx.notify();
+        }
+    }
+
+    fn dismiss_completion(
+        &mut self,
+        _: &DismissCompletion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.completion.is_some() || self.completion_cancel.is_some() {
+            self.revision = self.revision.wrapping_add(1);
+            self.cancel_completion();
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    pub fn detected_language(&self) -> Option<Language> {
+        self.document.path().and_then(Language::from_path)
+    }
+
+    pub fn syntax_highlighting_ready(&self) -> bool {
+        self.syntax.is_some()
+    }
+
+    pub fn refresh_syntax(&mut self) {
+        self.syntax = self
+            .document
             .path()
             .and_then(Language::from_path)
             .and_then(|language| SyntaxHighlighter::new(language).ok());
         if let Some(syntax) = &mut self.syntax {
-            syntax.set_text(document.text());
+            syntax.set_text(self.document.text());
         }
+    }
+
+    pub fn set_document(&mut self, mut document: Document, cx: &mut Context<Self>) {
+        self.revision = self.revision.wrapping_add(1);
+        self.cancel_completion();
+        let _ = document.set_selection(0..0);
+        self.max_line_columns = max_line_columns(&document);
         self.document = document;
+        self.refresh_syntax();
         self.marked_range = None;
+        self.selection_reversed = false;
         self.last_layouts.clear();
+        self.last_bounds = None;
+        self.reveal_cursor = false;
+        self.scroll_handle.set_offset(point(px(0.0), px(0.0)));
         cx.notify();
+    }
+
+    fn gutter_width(&self) -> f32 {
+        let digits = self.document.line_count().max(1).ilog10() as usize + 1;
+        22.0 + digits.max(4) as f32 * 8.0
+    }
+
+    fn refresh_content_metrics(&mut self) {
+        self.max_line_columns = max_line_columns(&self.document);
     }
 
     fn cursor_offset(&self) -> usize {
@@ -122,12 +358,17 @@ impl DocumentView {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.revision = self.revision.wrapping_add(1);
+        self.cancel_completion();
         let _ = self.document.set_selection(offset..offset);
         self.selection_reversed = false;
+        self.reveal_cursor = true;
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.revision = self.revision.wrapping_add(1);
+        self.cancel_completion();
         let mut range = self.document.selection();
         if self.selection_reversed {
             range.start = offset;
@@ -139,6 +380,7 @@ impl DocumentView {
             range = range.end..range.start;
         }
         let _ = self.document.set_selection(range);
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -173,14 +415,38 @@ impl DocumentView {
     }
 
     fn vertical_offset(&self, direction: isize) -> usize {
-        let cursor = self.cursor_offset();
-        let (line, column) = self.line_column(cursor);
+        let (line, column) = self.document.line_col_at(self.cursor_offset());
         let target_line = if direction < 0 {
-            line.saturating_sub(1)
+            line.saturating_sub(direction.unsigned_abs())
         } else {
-            line + 1
+            line.saturating_add(direction as usize)
+                .min(self.document.line_count().saturating_sub(1))
         };
-        self.offset_for_line_column(target_line, column)
+        self.document.offset_for_line_col(target_line, column)
+    }
+
+    fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        let pages = self.visible_page_lines();
+        self.move_to(self.vertical_offset(-(pages as isize)), cx);
+    }
+
+    fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        let pages = self.visible_page_lines();
+        self.move_to(self.vertical_offset(pages as isize), cx);
+    }
+
+    fn visible_page_lines(&self) -> usize {
+        (f32::from(self.scroll_handle.bounds().size.height) / LINE_HEIGHT)
+            .floor()
+            .max(1.0) as usize
+    }
+
+    fn document_start(&mut self, _: &DocumentStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn document_end(&mut self, _: &DocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.document.text().len(), cx);
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -197,14 +463,13 @@ impl DocumentView {
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, _) = self.line_column(self.cursor_offset());
-        self.move_to(self.offset_for_line_column(line, 0), cx);
+        let line = self.document.line_of_offset(self.cursor_offset());
+        self.move_to(self.document.line_range(line).start, cx);
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, _) = self.line_column(self.cursor_offset());
-        let end = self.line_ranges()[line].end;
-        self.move_to(end, cx);
+        let line = self.document.line_of_offset(self.cursor_offset());
+        self.move_to(self.document.line_range(line).end, cx);
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -245,7 +510,16 @@ impl DocumentView {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.cancel_completion();
         self.document.undo();
+        self.marked_range = None;
+        self.selection_reversed = false;
+        self.reveal_cursor = true;
+        self.refresh_content_metrics();
         if let Some(syntax) = &mut self.syntax {
             syntax.set_text(self.document.text());
         }
@@ -254,7 +528,16 @@ impl DocumentView {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.cancel_completion();
         self.document.redo();
+        self.marked_range = None;
+        self.selection_reversed = false;
+        self.reveal_cursor = true;
+        self.refresh_content_metrics();
         if let Some(syntax) = &mut self.syntax {
             syntax.set_text(self.document.text());
         }
@@ -267,7 +550,17 @@ impl DocumentView {
     }
 
     fn tab(&mut self, _: &InsertTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.replace_text_in_range(None, "    ", window, cx);
+        let suggestion = self.completion.take().filter(|(revision, cursor, _)| {
+            *revision == self.revision && self.document.selection() == (*cursor..*cursor)
+        });
+        self.replace_text_in_range(
+            None,
+            suggestion
+                .as_ref()
+                .map_or("    ", |(_, _, text)| text.as_str()),
+            window,
+            cx,
+        );
     }
 
     fn show_character_palette(
@@ -301,6 +594,9 @@ impl DocumentView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.is_selecting = false;
+        }
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
@@ -393,78 +689,24 @@ impl DocumentView {
         let Some(bounds) = self.last_bounds else {
             return 0;
         };
-        let line_height = px(22.0);
-        let line = ((position.y - bounds.top()) / line_height).floor().max(0.0) as usize;
-        let line = line.min(self.line_ranges().len().saturating_sub(1));
+        let line = ((position.y - bounds.top()) / px(LINE_HEIGHT))
+            .floor()
+            .max(0.0) as usize;
+        let line = line.min(self.document.line_count().saturating_sub(1));
+        let range = self.document.line_range(line);
         let Some(layout) = self.last_layouts.get(&line) else {
-            return 0;
+            return range.start;
         };
-        let line_start = self.line_ranges()[line].start;
-        line_start + layout.closest_index_for_x(position.x - bounds.left() - px(54.0))
-    }
-
-    fn line_ranges(&self) -> Vec<Range<usize>> {
-        let text = self.document.text();
-        let mut ranges = Vec::new();
-        let mut start = 0;
-        for (index, character) in text.char_indices() {
-            if character == '\n' {
-                ranges.push(start..index);
-                start = index + 1;
-            }
-        }
-        ranges.push(start..text.len());
-        ranges
-    }
-
-    fn line_column(&self, offset: usize) -> (usize, usize) {
-        let ranges = self.line_ranges();
-        let line = ranges
-            .iter()
-            .position(|range| offset >= range.start && offset <= range.end)
-            .unwrap_or(ranges.len().saturating_sub(1));
-        (line, offset - ranges[line].start)
-    }
-
-    fn offset_for_line_column(&self, line: usize, column: usize) -> usize {
-        let ranges = self.line_ranges();
-        let line = line.min(ranges.len().saturating_sub(1));
-        let range = &ranges[line];
-        let line_text = &self.document.text()[range.clone()];
-        let mut utf8_column = 0;
-        for (index, character) in line_text.char_indices() {
-            if index >= column {
-                break;
-            }
-            utf8_column = index + character.len_utf8();
-        }
-        range.start + utf8_column.min(range.len())
+        let x = position.x - bounds.left() - px(self.gutter_width());
+        (range.start + layout.closest_index_for_x(x)).min(range.end)
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for character in self.document.text().chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += character.len_utf16();
-            utf8_offset += character.len_utf8();
-        }
-        utf8_offset
+        utf16_to_byte(self.document.text(), offset)
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-        for character in self.document.text().chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += character.len_utf8();
-            utf16_offset += character.len_utf16();
-        }
-        utf16_offset
+        byte_to_utf16(self.document.text(), offset)
     }
 
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
@@ -476,6 +718,91 @@ impl DocumentView {
     }
 }
 
+pub(crate) fn utf16_to_byte(text: &str, offset: usize) -> usize {
+    let mut utf16_offset = 0;
+    for (index, character) in text.char_indices() {
+        if utf16_offset >= offset {
+            return index;
+        }
+        utf16_offset += character.len_utf16();
+    }
+    text.len()
+}
+
+fn byte_to_utf16(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    text.char_indices()
+        .take_while(|(index, _)| *index < offset)
+        .map(|(_, character)| character.len_utf16())
+        .sum()
+}
+
+fn display_columns(text: &str) -> usize {
+    text.chars().fold(0usize, |columns, character| {
+        let width = match character {
+            '\t' => 4,
+            character if character.is_ascii() => 1,
+            _ => 2,
+        };
+        columns.saturating_add(width)
+    })
+}
+
+fn max_line_columns(document: &Document) -> usize {
+    (0..document.line_count())
+        .map(|line| display_columns(&document.text()[document.line_range(line)]))
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn visible_line_range(scroll_offset: f32, viewport_height: f32, line_count: usize) -> Range<usize> {
+    if line_count == 0 {
+        return 0..0;
+    }
+    let scroll_offset = if scroll_offset.is_finite() {
+        scroll_offset.max(0.0)
+    } else {
+        0.0
+    };
+    let viewport_height = if viewport_height.is_finite() {
+        viewport_height.max(0.0)
+    } else {
+        0.0
+    };
+    let first = ((scroll_offset / LINE_HEIGHT).floor() as usize).min(line_count - 1);
+    let visible = ((viewport_height / LINE_HEIGHT).ceil().max(1.0) as usize).saturating_add(2);
+    first..first.saturating_add(visible).min(line_count)
+}
+
+fn reveal_delta(start: f32, end: f32, visible_start: f32, visible_end: f32) -> f32 {
+    if !start.is_finite()
+        || !end.is_finite()
+        || !visible_start.is_finite()
+        || !visible_end.is_finite()
+    {
+        return 0.0;
+    }
+    if start < visible_start {
+        visible_start - start
+    } else if end > visible_end {
+        visible_end - end
+    } else {
+        0.0
+    }
+}
+
+fn clamp_scroll_offset(offset: f32, maximum: f32) -> f32 {
+    if !offset.is_finite() || !maximum.is_finite() {
+        return 0.0;
+    }
+    offset.clamp(-maximum.max(0.0), 0.0)
+}
+
+fn line_number_text(line_index: usize, width: usize) -> String {
+    format!("{:>width$}", line_index + 1)
+}
+
 impl EntityInputHandler for DocumentView {
     fn text_for_range(
         &mut self,
@@ -485,6 +812,9 @@ impl EntityInputHandler for DocumentView {
         _: &mut Context<Self>,
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
+        if range.start > range.end {
+            return None;
+        }
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.document.text()[range].to_string())
     }
@@ -515,23 +845,39 @@ impl EntityInputHandler for DocumentView {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range_utf16
+        if self.read_only {
+            return;
+        }
+        let mut range = range_utf16
             .as_ref()
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.document.selection());
+        if range.is_empty()
+            && range.start > 0
+            && self.document.text().as_bytes()[range.start - 1] == b'\r'
+            && self.document.text().as_bytes().get(range.start) == Some(&b'\n')
+        {
+            range.start -= 1;
+            range.end -= 1;
+        }
         let old_text = self.document.text().to_string();
         if self.document.replace_range(range.clone(), new_text).is_ok() {
+            self.revision = self.revision.wrapping_add(1);
+            self.completion = None;
             if let Some(syntax) = &mut self.syntax {
                 syntax.replace_range(&old_text, self.document.text(), range, new_text);
             }
             self.selection_reversed = false;
             self.marked_range = None;
             self.last_layouts.clear();
+            self.reveal_cursor = true;
+            self.refresh_content_metrics();
             cx.notify();
+            self.schedule_completion(window, cx);
         }
     }
 
@@ -543,21 +889,25 @@ impl EntityInputHandler for DocumentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let insertion_start = range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.document.selection())
-            .start;
+        if self.read_only {
+            return;
+        }
         self.replace_text_in_range(range_utf16, new_text, window, cx);
+        let insertion_start = self
+            .document
+            .selection()
+            .start
+            .saturating_sub(new_text.len());
         if !new_text.is_empty() {
             self.marked_range = Some(insertion_start..insertion_start + new_text.len());
         }
         if let Some(selection) = new_selected_range_utf16 {
-            let selection = self.range_from_utf16(&selection);
+            // IME selection offsets are relative to the newly composed text.
+            let start = utf16_to_byte(new_text, selection.start);
+            let end = utf16_to_byte(new_text, selection.end);
             let _ = self
                 .document
-                .set_selection(insertion_start + selection.start..insertion_start + selection.end);
+                .set_selection(insertion_start + start..insertion_start + end);
         }
         cx.notify();
     }
@@ -570,18 +920,29 @@ impl EntityInputHandler for DocumentView {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range_utf16);
-        let (start_line, start_column) = self.line_column(range.start);
-        let (end_line, end_column) = self.line_column(range.end);
+        let start_line = self.document.line_of_offset(range.start);
+        let end_line = self.document.line_of_offset(range.end);
+        let start_range = self.document.line_range(start_line);
+        let end_range = self.document.line_range(end_line);
+        let start_column = range
+            .start
+            .saturating_sub(start_range.start)
+            .min(start_range.len());
+        let end_column = range
+            .end
+            .saturating_sub(end_range.start)
+            .min(end_range.len());
         let start_layout = self.last_layouts.get(&start_line)?;
         let end_layout = self.last_layouts.get(&end_line)?;
+        let gutter = px(self.gutter_width());
         Some(Bounds::from_corners(
             point(
-                bounds.left() + px(54.0) + start_layout.x_for_index(start_column),
-                bounds.top() + px(22.0 * start_line as f32),
+                bounds.left() + gutter + start_layout.x_for_index(start_column),
+                bounds.top() + px(LINE_HEIGHT * start_line as f32),
             ),
             point(
-                bounds.left() + px(54.0) + end_layout.x_for_index(end_column),
-                bounds.top() + px(22.0 * (end_line + 1) as f32),
+                bounds.left() + gutter + end_layout.x_for_index(end_column),
+                bounds.top() + px(LINE_HEIGHT * (end_line + 1) as f32),
             ),
         ))
     }
@@ -605,6 +966,7 @@ struct PrepaintState {
     numbers: Vec<(usize, ShapedLine)>,
     selection: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
+    completion: Option<(Point<Pixels>, ShapedLine)>,
 }
 
 impl IntoElement for DocumentElement {
@@ -634,10 +996,19 @@ impl Element for DocumentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let line_count = self.input.read(cx).line_ranges().len();
+        let input = self.input.read(cx);
+        let line_count = input.document.line_count();
+        let text_style = window.text_style();
+        let font_size = f32::from(text_style.font_size.to_pixels(window.rem_size()));
+        // Consolas advances are below 0.65em. Non-ASCII columns are conservatively
+        // counted as two cells so long lines remain reachable without shaping the file.
+        let content_width =
+            input.gutter_width() + input.max_line_columns as f32 * font_size * 0.65 + TEXT_PADDING;
         let mut style = Style::default();
-        style.size.width = relative(1.0).into();
-        style.size.height = px(22.0 * line_count as f32).into();
+        style.size.width = px(content_width).into();
+        style.min_size.width = relative(1.0).into();
+        style.size.height = px(LINE_HEIGHT * line_count as f32).into();
+        style.min_size.height = relative(1.0).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -650,26 +1021,54 @@ impl Element for DocumentElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let scale_factor = window.scale_factor();
+        let (first, last, geometry_changed) = {
+            let input = self.input.read(cx);
+            let scroll_offset = -input.scroll_handle.offset().y;
+            let viewport_height = input
+                .scroll_handle
+                .bounds()
+                .size
+                .height
+                .max(window.content_mask().bounds.size.height);
+            let visible = visible_line_range(
+                scroll_offset.into(),
+                viewport_height.into(),
+                input.document.line_count(),
+            );
+            let first = visible.start;
+            let last = visible.end;
+            let geometry_changed = input.last_bounds.is_some_and(|old| old.size != bounds.size)
+                || input.last_scale_factor != scale_factor;
+            (first, last, geometry_changed)
+        };
+        self.input.update(cx, |input, _| {
+            // Invalidate before shaping, and retain only the virtualized window.
+            if geometry_changed {
+                input.last_layouts.clear();
+            } else {
+                input
+                    .last_layouts
+                    .retain(|line, _| *line >= first && *line < last);
+            }
+            input.last_scale_factor = scale_factor;
+        });
         let input = self.input.read(cx);
         let text = input.document.text();
         let selection = input.document.selection();
         let cursor = input.cursor_offset();
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_ranges = input.line_ranges();
-        let scroll_offset = -input.scroll_handle.offset().y;
-        let first = (scroll_offset / px(22.0)).floor().max(0.0) as usize;
-        let visible = (input.scroll_handle.bounds().size.height / px(22.0))
-            .ceil()
-            .max(1.0) as usize
-            + 2;
-        let last = (first + visible).min(line_ranges.len());
+        let gutter = px(input.gutter_width());
+        let number_width = input.document.line_count().max(1).ilog10() as usize + 1;
         let mut lines = Vec::new();
         let mut numbers = Vec::new();
         let mut selection_quads = Vec::new();
         let mut cursor_quad = None;
+        let mut completion = None;
 
-        for (line_index, range) in line_ranges.iter().enumerate().take(last).skip(first) {
+        for line_index in first..last {
+            let range = input.document.line_range(line_index);
             let line_text = &text[range.clone()];
             let run = TextRun {
                 len: line_text.len(),
@@ -708,7 +1107,7 @@ impl Element for DocumentElement {
                 .filter(|run| run.len > 0)
                 .collect()
             } else {
-                highlight_runs(input, range, run)
+                highlight_runs(input, &range, run)
             };
             let line = window.text_system().shape_line(
                 line_text.to_owned().into(),
@@ -716,21 +1115,20 @@ impl Element for DocumentElement {
                 &runs,
                 None,
             );
+            let number_text = line_number_text(line_index, number_width);
             let number_run = TextRun {
-                len: 4,
+                len: number_text.len(),
                 font: style.font(),
                 color: style.color.opacity(0.4),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             };
-            let number = window.text_system().shape_line(
-                format!("{:>4}", line_index + 1).into(),
-                font_size,
-                &[number_run],
-                None,
-            );
-            let top = bounds.top() + px(22.0 * line_index as f32);
+            let number =
+                window
+                    .text_system()
+                    .shape_line(number_text.into(), font_size, &[number_run], None);
+            let top = bounds.top() + px(LINE_HEIGHT * line_index as f32);
 
             let selected_start = selection.start.max(range.start);
             let selected_end = selection.end.min(range.end);
@@ -743,18 +1141,39 @@ impl Element for DocumentElement {
                 let end_x = line.x_for_index(selected_end.saturating_sub(range.start));
                 selection_quads.push(fill(
                     Bounds::new(
-                        point(bounds.left() + px(54.0) + start_x, top),
-                        size((end_x - start_x).max(px(4.0)), px(22.0)),
+                        point(bounds.left() + gutter + start_x, top),
+                        size((end_x - start_x).max(px(4.0)), px(LINE_HEIGHT)),
                     ),
                     rgba(0x7c8cff40),
                 ));
             }
             if cursor >= range.start && cursor <= range.end {
                 let cursor_x = line.x_for_index(cursor - range.start);
+                if let Some((revision, offset, suggestion)) = &input.completion
+                    && *revision == input.revision
+                    && *offset == cursor
+                    && selection.is_empty()
+                {
+                    let run = TextRun {
+                        len: suggestion.len(),
+                        font: style.font(),
+                        color: style.color.opacity(0.45),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = window.text_system().shape_line(
+                        suggestion.clone().into(),
+                        font_size,
+                        &[run],
+                        None,
+                    );
+                    completion = Some((point(bounds.left() + gutter + cursor_x, top), shaped));
+                }
                 cursor_quad = Some(fill(
                     Bounds::new(
-                        point(bounds.left() + px(54.0) + cursor_x, top),
-                        size(px(2.0), px(22.0)),
+                        point(bounds.left() + gutter + cursor_x, top),
+                        size(px(2.0), px(LINE_HEIGHT)),
                     ),
                     style.color,
                 ));
@@ -767,6 +1186,7 @@ impl Element for DocumentElement {
             numbers,
             selection: selection_quads,
             cursor: cursor_quad,
+            completion,
         }
     }
 
@@ -780,7 +1200,10 @@ impl Element for DocumentElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.input.read(cx).focus_handle.clone();
+        let (focus_handle, gutter) = {
+            let input = self.input.read(cx);
+            (input.focus_handle.clone(), px(input.gutter_width()))
+        };
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
@@ -791,18 +1214,21 @@ impl Element for DocumentElement {
         }
         for (index, line) in prepaint.lines.drain(..) {
             let origin = point(
-                bounds.left() + px(54.0),
-                bounds.top() + px(22.0 * index as f32),
+                bounds.left() + gutter,
+                bounds.top() + px(LINE_HEIGHT * index as f32),
             );
-            let _ = line.paint(origin, px(22.0), window, cx);
+            let _ = line.paint(origin, px(LINE_HEIGHT), window, cx);
             self.input.update(cx, |input, _| {
                 input.last_layouts.insert(index, line.clone());
             });
         }
         for (index, number) in prepaint.numbers.drain(..) {
             let _ = number.paint(
-                point(bounds.left(), bounds.top() + px(22.0 * index as f32)),
-                px(22.0),
+                point(
+                    bounds.left() + px(8.0),
+                    bounds.top() + px(LINE_HEIGHT * index as f32),
+                ),
+                px(LINE_HEIGHT),
                 window,
                 cx,
             );
@@ -812,9 +1238,66 @@ impl Element for DocumentElement {
         {
             window.paint_quad(cursor);
         }
+        if focus_handle.is_focused(window)
+            && let Some((origin, line)) = prepaint.completion.take()
+        {
+            let _ = line.paint(origin, px(LINE_HEIGHT), window, cx);
+        }
+        let visible = window.content_mask().bounds;
         self.input.update(cx, |input, _| {
             input.last_bounds = Some(bounds);
+            if std::mem::take(&mut input.reveal_cursor) {
+                input.scroll_cursor_into_view(bounds, visible, window);
+            }
         });
+    }
+}
+
+impl DocumentView {
+    fn scroll_cursor_into_view(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        visible: Bounds<Pixels>,
+        window: &mut Window,
+    ) {
+        let cursor = self.cursor_offset();
+        let line = self.document.line_of_offset(cursor);
+        let range = self.document.line_range(line);
+        let column = cursor.saturating_sub(range.start).min(range.len());
+        let top = bounds.top() + px(LINE_HEIGHT * line as f32);
+        let bottom = top + px(LINE_HEIGHT);
+        let mut delta_x = px(0.0);
+        let delta_y = px(reveal_delta(
+            top.into(),
+            bottom.into(),
+            visible.top().into(),
+            visible.bottom().into(),
+        ));
+        if let Some(layout) = self.last_layouts.get(&line) {
+            let left = bounds.left() + px(self.gutter_width()) + layout.x_for_index(column);
+            let right = left + px(2.0);
+            delta_x = px(reveal_delta(
+                left.into(),
+                right.into(),
+                visible.left().into(),
+                visible.right().into(),
+            ));
+        } else if !delta_y.is_zero() {
+            // The caret line was offscreen. Reveal vertically now and horizontally
+            // after its layout has been shaped on the next frame.
+            self.reveal_cursor = true;
+        }
+        if delta_x.is_zero() && delta_y.is_zero() {
+            return;
+        }
+        let offset = self.scroll_handle.offset();
+        let maximum = self.scroll_handle.max_offset();
+        let next = point(offset.x + delta_x, offset.y + delta_y);
+        self.scroll_handle.set_offset(point(
+            px(clamp_scroll_offset(next.x.into(), maximum.width.into())),
+            px(clamp_scroll_offset(next.y.into(), maximum.height.into())),
+        ));
+        window.on_next_frame(|window, _| window.refresh());
     }
 }
 
@@ -824,10 +1307,7 @@ fn highlight_runs(input: &DocumentView, line_range: &Range<usize>, base: TextRun
     };
     let mut runs = Vec::new();
     let mut cursor = 0usize;
-    for span in syntax.spans() {
-        if span.range.end <= line_range.start || span.range.start >= line_range.end {
-            continue;
-        }
+    for span in syntax.spans_in_range(line_range.clone()) {
         let start = span.range.start.max(line_range.start) - line_range.start;
         let end = span.range.end.min(line_range.end) - line_range.start;
         if start < cursor || end <= start {
@@ -864,6 +1344,7 @@ fn highlight_color(kind: HighlightKind) -> gpui::Hsla {
         HighlightKind::Function => gpui::rgb(0x61afef).into(),
         HighlightKind::Type => gpui::rgb(0xe5c07b).into(),
         HighlightKind::Macro => gpui::rgb(0xe06c75).into(),
+        HighlightKind::Attribute => gpui::rgb(0xd19a66).into(),
     }
 }
 
@@ -871,11 +1352,12 @@ impl Render for DocumentView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .relative()
+            .size_full()
             .id("document-editor-scroll")
             .key_context("Document")
             .track_focus(&self.focus_handle(cx))
             .track_scroll(&self.scroll_handle)
-            .overflow_y_scroll()
+            .overflow_scroll()
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -883,6 +1365,10 @@ impl Render for DocumentView {
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::document_start))
+            .on_action(cx.listener(Self::document_end))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
             .on_action(cx.listener(Self::select_all))
@@ -895,6 +1381,7 @@ impl Render for DocumentView {
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::dismiss_completion))
             .on_action(cx.listener(Self::show_character_palette))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
@@ -911,5 +1398,70 @@ impl Render for DocumentView {
 impl Focusable for DocumentView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl Drop for DocumentView {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.completion_cancel.take() {
+            cancel.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn completion_accepts_only_current_revision_and_tab_is_undoable(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| DocumentView::new(cx));
+        cx.update(|window, app| {
+            view.update(app, |document, cx| {
+                document.set_document(Document::from_text("fn "), cx);
+                document.document_mut().set_selection(3..3).unwrap();
+                let (revision, cursor, _) = document.completion_context().unwrap();
+                document.move_to(2, cx);
+                document.move_to(3, cx);
+                document.set_completion(revision, cursor, "stale", cx);
+                assert!(document.completion.is_none());
+                let (revision, cursor, _) = document.completion_context().unwrap();
+                document.set_completion(revision, cursor, "main() {}\nnot shown", cx);
+                document.tab(&InsertTab, window, cx);
+                assert_eq!(document.document().text(), "fn main() {}");
+                document.undo(&Undo, window, cx);
+                assert_eq!(document.document().text(), "fn ");
+            })
+        });
+    }
+
+    #[test]
+    fn utf16_offsets_are_relative_and_never_split_unicode() {
+        let text = "a🦀b";
+        assert_eq!(utf16_to_byte(text, 0), 0);
+        assert_eq!(utf16_to_byte(text, 1), 1);
+        assert_eq!(utf16_to_byte(text, 3), 5);
+        assert_eq!(utf16_to_byte(text, 4), 6);
+        assert_eq!(byte_to_utf16(text, 5), 3);
+        assert!(text.is_char_boundary(utf16_to_byte(text, 2)));
+    }
+
+    #[test]
+    fn virtualizes_and_formats_lines_past_four_digits() {
+        let visible = visible_line_range(9999.0 * LINE_HEIGHT, 44.0, 12_000);
+        assert_eq!(visible, 9999..10_003);
+        let number = line_number_text(9999, 5);
+        assert_eq!(number, "10000");
+        assert_eq!(number.len(), 5);
+    }
+
+    #[test]
+    fn caret_reveal_and_scrollbar_offsets_are_clamped() {
+        assert_eq!(reveal_delta(20.0, 42.0, 0.0, 100.0), 0.0);
+        assert_eq!(reveal_delta(-20.0, 2.0, 0.0, 100.0), 20.0);
+        assert_eq!(reveal_delta(90.0, 112.0, 0.0, 100.0), -12.0);
+        assert_eq!(clamp_scroll_offset(-500.0, 120.0), -120.0);
+        assert_eq!(clamp_scroll_offset(20.0, 120.0), 0.0);
+        assert_eq!(clamp_scroll_offset(f32::NAN, 120.0), 0.0);
     }
 }

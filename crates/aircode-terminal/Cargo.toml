@@ -1,0 +1,15 @@
+[package]
+name = "aircode-terminal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+publish = false
+description = "Isolated ConPTY and vt100 terminal backend prototype"
+
+[lib]
+name = "terminal_lab"
+path = "src/lib.rs"
+
+[dependencies]
+portable-pty = "=0.8.1"
+vt100 = "=0.16.2"

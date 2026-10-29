@@ -37,6 +37,20 @@ impl SseDecoder {
 
         Ok(events)
     }
+
+    /// Flush a final event when the peer closes without a blank line.
+    pub fn finish(&mut self) -> Result<Vec<String>, String> {
+        let mut events = if self.buffer.is_empty() {
+            Vec::new()
+        } else {
+            self.push(b"\n")?
+        };
+        if !self.data_lines.is_empty() {
+            events.push(self.data_lines.join("\n"));
+            self.data_lines.clear();
+        }
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
@@ -74,5 +88,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(events, ["ok"]);
+    }
+
+    #[test]
+    fn finish_flushes_an_unterminated_final_event() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push(b"data: tail\n").unwrap().is_empty());
+        assert_eq!(decoder.finish().unwrap(), ["tail"]);
+        assert!(decoder.finish().unwrap().is_empty());
     }
 }

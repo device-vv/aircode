@@ -7,6 +7,9 @@ use std::{
 use serde_json::{Value, json};
 use similar::TextDiff;
 
+const DISCOVERY_LIMIT: usize = 500;
+const SEARCH_MATCH_LIMIT: usize = 100;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionMode {
     AskEvery,
@@ -206,14 +209,20 @@ impl AgentExecutor {
     fn list_files(&self, base: &Path) -> Result<String, String> {
         let mut paths = Vec::new();
         self.walk(base, &mut paths);
+        let truncated = paths.len() > DISCOVERY_LIMIT;
         let mut output: Vec<_> = paths.iter().map(|path| self.relative(path)).collect();
         output.sort();
-        output.truncate(500);
+        output.truncate(DISCOVERY_LIMIT);
+        if truncated {
+            output.push(format!(
+                "... [file list truncated after {DISCOVERY_LIMIT} entries; project inspection is incomplete]"
+            ));
+        }
         Ok(output.join("\n"))
     }
 
     fn walk(&self, base: &Path, output: &mut Vec<PathBuf>) {
-        if output.len() >= 500 {
+        if output.len() > DISCOVERY_LIMIT {
             return;
         }
         let Ok(entries) = fs::read_dir(base) else {
@@ -244,8 +253,9 @@ impl AgentExecutor {
         }
         let mut files = Vec::new();
         self.walk(base, &mut files);
+        let files_truncated = files.len() > DISCOVERY_LIMIT;
         let mut matches = Vec::new();
-        for path in files.into_iter().take(500) {
+        for path in files.into_iter().take(DISCOVERY_LIMIT) {
             if !path.is_file() {
                 continue;
             }
@@ -260,11 +270,19 @@ impl AgentExecutor {
                         index + 1,
                         line.trim()
                     ));
-                    if matches.len() >= 100 {
+                    if matches.len() >= SEARCH_MATCH_LIMIT {
+                        matches.push(format!(
+                            "... [search truncated after {SEARCH_MATCH_LIMIT} matches; project inspection is incomplete]"
+                        ));
                         return Ok(matches.join("\n"));
                     }
                 }
             }
+        }
+        if files_truncated {
+            matches.push(format!(
+                "... [search covered only the first {DISCOVERY_LIMIT} discovered files; project inspection is incomplete]"
+            ));
         }
         Ok(matches.join("\n"))
     }
@@ -356,9 +374,9 @@ fn truncate(text: &str, max: usize) -> String {
 
 pub fn tool_definitions() -> Value {
     json!([
-        {"type":"function","function":{"name":"list_files","description":"List project files","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":[]}}},
-        {"type":"function","function":{"name":"read_file","description":"Read a UTF-8 project file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
-        {"type":"function","function":{"name":"search_text","description":"Search text in project files","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"}},"required":["query"]}}},
+        {"type":"function","function":{"name":"list_files","description":"List up to 500 project files; truncated results mean inspection is incomplete","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":[]}}},
+        {"type":"function","function":{"name":"read_file","description":"Read a bounded excerpt of a UTF-8 project file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+        {"type":"function","function":{"name":"search_text","description":"Search a bounded set of project files and matches; truncated results mean inspection is incomplete","parameters":{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"}},"required":["query"]}}},
         {"type":"function","function":{"name":"write_file","description":"Create or replace a project file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
         {"type":"function","function":{"name":"create_directory","description":"Create a project directory","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
         {"type":"function","function":{"name":"move_file","description":"Move or rename a project file","parameters":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}},"required":["from","to"]}}},

@@ -1,0 +1,15 @@
+[package]
+name = "aircode-history"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Isolated, revision-safe project chat history persistence and compaction planning"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "project_chat_history"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

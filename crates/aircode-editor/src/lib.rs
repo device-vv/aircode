@@ -47,6 +47,7 @@ pub struct Document {
     selection: Range<usize>,
     undo: Vec<EditRecord>,
     redo: Vec<EditRecord>,
+    line_starts: Vec<usize>,
 }
 
 impl Default for Document {
@@ -64,6 +65,7 @@ impl Document {
             selection: 0..0,
             undo: Vec::new(),
             redo: Vec::new(),
+            line_starts: vec![0],
         }
     }
 
@@ -72,6 +74,7 @@ impl Document {
         document.text = text.into();
         document.saved_text = document.text.clone();
         document.selection = document.text.len()..document.text.len();
+        document.reindex();
         document
     }
 
@@ -123,6 +126,69 @@ impl Document {
         self.text != self.saved_text
     }
 
+    fn reindex(&mut self) {
+        self.line_starts.clear();
+        self.line_starts.push(0);
+        self.line_starts.extend(
+            self.text
+                .bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(index, _)| index + 1),
+        );
+    }
+
+    /// Number of lines. An empty document still has one editable line.
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+
+    /// Byte range of a line, excluding its LF or CRLF terminator.
+    pub fn line_range(&self, line: usize) -> Range<usize> {
+        let line = line.min(self.line_starts.len().saturating_sub(1));
+        let start = self.line_starts[line];
+        match self.line_starts.get(line + 1) {
+            Some(next) => {
+                let mut end = next - 1;
+                if end > start && self.text.as_bytes()[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                start..end
+            }
+            None => start..self.text.len(),
+        }
+    }
+
+    /// Line containing an offset. Offsets inside a CRLF belong to that line.
+    pub fn line_of_offset(&self, offset: usize) -> usize {
+        self.line_starts
+            .partition_point(|start| *start <= offset)
+            .saturating_sub(1)
+    }
+
+    /// Zero-based line and Unicode-scalar column, clamped to the document.
+    pub fn line_col_at(&self, offset: usize) -> (usize, usize) {
+        let offset = offset.min(self.text.len());
+        let line = self.line_of_offset(offset);
+        let range = self.line_range(line);
+        let mut end = offset.clamp(range.start, range.end);
+        while !self.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        (line, self.text[range.start..end].chars().count())
+    }
+
+    /// Inverse of [`Self::line_col_at`], clamped to the requested line.
+    pub fn offset_for_line_col(&self, line: usize, column: usize) -> usize {
+        let line = line.min(self.line_starts.len().saturating_sub(1));
+        let range = self.line_range(line);
+        self.text[range.clone()]
+            .char_indices()
+            .nth(column)
+            .map(|(index, _)| range.start + index)
+            .unwrap_or(range.end)
+    }
+
     pub fn selection(&self) -> Range<usize> {
         self.selection.clone()
     }
@@ -159,9 +225,22 @@ impl Document {
         {
             return Err(DocumentError::InvalidRange);
         }
+        if range.is_empty() && replacement.is_empty() {
+            return Ok(());
+        }
+        let mut range = range;
+        // Do not let an insertion between CR and LF split the line ending.
+        if range.is_empty()
+            && range.start > 0
+            && self.text.as_bytes()[range.start - 1] == b'\r'
+            && self.text.as_bytes().get(range.start) == Some(&b'\n')
+        {
+            range = range.start - 1..range.start - 1;
+        }
         let selection_before = self.selection.clone();
         let deleted = self.text[range.clone()].to_string();
         self.text.replace_range(range.clone(), replacement);
+        self.reindex();
         let cursor = range.start + replacement.len();
         self.selection = cursor..cursor;
         self.undo.push(EditRecord {
@@ -183,6 +262,7 @@ impl Document {
             edit.range.start..edit.range.start + edit.inserted.len(),
             &edit.deleted,
         );
+        self.reindex();
         self.selection = edit.selection_before.clone();
         self.redo.push(edit);
         true
@@ -193,6 +273,7 @@ impl Document {
             return false;
         };
         self.text.replace_range(edit.range.clone(), &edit.inserted);
+        self.reindex();
         self.selection = edit.selection_after.clone();
         self.undo.push(edit);
         true
@@ -215,12 +296,8 @@ impl Document {
     }
 
     pub fn line_col(&self) -> (usize, usize) {
-        let offset = self.selection.end;
-        let before = &self.text[..offset];
-        let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
-        let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
-        let column = self.text[line_start..offset].chars().count() + 1;
-        (line, column)
+        let (line, column) = self.line_col_at(self.selection.end);
+        (line + 1, column + 1)
     }
 }
 
@@ -290,5 +367,59 @@ mod tests {
             .unwrap();
 
         assert_eq!(document.line_col(), (2, 2));
+    }
+
+    #[test]
+    fn indexed_lines_handle_crlf_and_unicode_columns() {
+        let document = Document::from_text("a🦀\r\nsecond\n");
+        assert_eq!(document.line_count(), 3);
+        assert_eq!(document.line_range(0), 0..5);
+        assert_eq!(document.line_range(1), 7..13);
+        assert_eq!(document.line_of_offset(6), 0);
+        assert_eq!(document.line_col_at(1), (0, 1));
+        assert_eq!(document.line_col_at(2), (0, 1));
+        assert_eq!(document.line_col_at(5), (0, 2));
+        assert_eq!(document.offset_for_line_col(0, 2), 5);
+        assert_eq!(document.offset_for_line_col(1, 6), 13);
+    }
+
+    #[test]
+    fn line_col_clamps_to_utf8_boundaries() {
+        let document = Document::from_text("Я🙂\nб");
+
+        assert_eq!(document.line_col_at(1), (0, 0));
+        assert_eq!(document.line_col_at(3), (0, 1));
+        assert_eq!(document.line_col_at(5), (0, 1));
+        assert_eq!(document.line_col_at(6), (0, 2));
+        assert_eq!(document.line_col_at(usize::MAX), (1, 1));
+    }
+
+    #[test]
+    fn insertion_cannot_split_crlf_and_undo_reindexes() {
+        let mut document = Document::from_text("a\r\nb");
+        document.set_selection(2..2).unwrap();
+        document.replace_selection("x").unwrap();
+        assert_eq!(document.text(), "ax\r\nb");
+        assert_eq!(document.line_count(), 2);
+        assert!(document.undo());
+        assert_eq!(document.text(), "a\r\nb");
+        assert_eq!(document.line_range(0), 0..1);
+        assert!(document.redo());
+        assert_eq!(document.text(), "ax\r\nb");
+        assert_eq!(document.line_range(0), 0..2);
+    }
+
+    #[test]
+    fn line_index_works_past_ten_thousand_lines() {
+        let text = (0..10_050)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let document = Document::from_text(text);
+        let range = document.line_range(9999);
+        assert_eq!(document.line_count(), 10_050);
+        assert_eq!(&document.text()[range.clone()], "line-9999");
+        assert_eq!(document.line_of_offset(range.start), 9999);
+        assert_eq!(document.line_of_offset(range.end), 9999);
     }
 }
