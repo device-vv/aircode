@@ -67,6 +67,24 @@ fn project_kind_key(kind: ProjectKind) -> &'static str {
     }
 }
 
+fn create_empty_file(path: PathBuf) -> std::io::Result<PathBuf> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok(path)
+}
+
+fn audit_preview(entry: &str) -> String {
+    entry
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(180)
+        .collect()
+}
+
 fn language_tools_status(
     language: Language,
     detected: Option<SyntaxLanguage>,
@@ -643,6 +661,7 @@ pub struct Workspace {
     settings_store: Option<SettingsStore>,
     permission: PermissionMode,
     agent_turn: AgentTurn,
+    agent_paused: bool,
     current_config: ProviderConfig,
     pending_tool: Option<(ToolCall, Option<String>)>,
     tool_running: bool,
@@ -798,6 +817,7 @@ impl Workspace {
             overlay_was_open: false,
             permission: PermissionMode::from_code(&settings.permission_mode),
             agent_turn: AgentTurn::default(),
+            agent_paused: false,
             current_config: settings.provider.clone(),
             pending_tool: None,
             tool_running: false,
@@ -989,6 +1009,49 @@ impl Workspace {
             return;
         }
         self.show_open_file_dialog(cx);
+    }
+
+    fn new_file_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.dialog_open {
+            return;
+        }
+        let directory = self
+            .project
+            .as_ref()
+            .map(|project| project.root().to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.dialog_open = true;
+        let receiver = cx.prompt_for_new_path(&directory, None);
+        cx.spawn(async move |this, cx| {
+            let result = receiver.await;
+            let _ = this.update(cx, |this, cx| {
+                this.dialog_open = false;
+                match result {
+                    Ok(Ok(Some(path))) => {
+                        let task = cx
+                            .background_executor()
+                            .spawn(async move { create_empty_file(path) });
+                        cx.spawn(async move |this, cx| {
+                            let result = task.await;
+                            let _ = this.update(cx, |this, cx| match result {
+                                Ok(path) => this.open_document_path(path, cx),
+                                Err(error) => {
+                                    this.status = error.to_string();
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                    Ok(Err(error)) => this.status = error.to_string(),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn show_open_file_dialog(&mut self, cx: &mut Context<Self>) {
@@ -1447,15 +1510,14 @@ impl Workspace {
                         .unwrap_or_else(|| cx.new(|cx| TerminalView::new(self.language, cx)));
                     self.terminal
                         .update(cx, |terminal, _| terminal.set_language(self.language));
-                    if self.terminal_visible {
-                        let root = next.clone();
-                        self.terminal
-                            .update(cx, |terminal, cx| terminal.start(root, cx));
-                    }
                     self.agent_turn.cancel();
+                    self.agent_paused = false;
                     self.audit.clear();
                 }
                 self.project = Some(project);
+                self.terminal_visible = true;
+                self.terminal
+                    .update(cx, |terminal, cx| terminal.start(next, cx));
                 self.project_watcher = None;
                 self.project_events = None;
                 if let Some(project) = &self.project {
@@ -1772,6 +1834,7 @@ impl Workspace {
         self.chat_input.update(cx, |input, cx| input.clear(cx));
         self.history_suspend -= 1;
         self.agent_turn.cancel();
+        self.agent_paused = false;
         self.agent_turn.begin(Vec::new());
         self.audit.clear();
         self.status = self.tr("new_session").into();
@@ -1779,6 +1842,7 @@ impl Workspace {
     }
 
     fn cancel_turn(&mut self, cx: &mut Context<Self>) {
+        self.agent_paused = false;
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }
@@ -1798,6 +1862,7 @@ impl Workspace {
     }
 
     fn fail_turn(&mut self, error: String, cx: &mut Context<Self>) {
+        self.agent_paused = false;
         if let Some(entry) = self.chat.last_mut()
             && entry.role == MessageRole::Assistant
         {
@@ -1929,6 +1994,7 @@ impl Workspace {
             request_messages.push(ChatMessage::system(PROJECT_CONTEXT_INSTRUCTIONS));
         }
         request_messages.push(ChatMessage::user(outbound));
+        self.agent_paused = false;
         self.agent_turn.begin(request_messages);
         let request_messages = match self.agent_turn.request_messages() {
             Ok(messages) => messages,
@@ -2096,9 +2162,20 @@ impl Workspace {
             }
             NextTool::FollowUp => self.start_followup(cx),
             NextTool::StepLimit => {
-                let error = self.tr("agent_step_limit").to_string();
-                self.fail_turn(error, cx);
+                self.streaming = false;
+                self.agent_paused = true;
+                self.status = self.tr("agent_step_limit").to_string();
+                self.persist_history(cx);
+                cx.notify();
             }
+        }
+    }
+
+    fn resume_agent(&mut self, cx: &mut Context<Self>) {
+        if self.agent_paused && self.agent_turn.resume() {
+            self.agent_paused = false;
+            self.streaming = true;
+            self.continue_agent(cx);
         }
     }
 
@@ -2331,6 +2408,7 @@ impl Workspace {
     }
 
     fn provider_changed(&mut self, cx: &mut Context<Self>) {
+        self.agent_paused = false;
         self.invalidate_summary();
         if self.streaming || self.pending_tool.is_some() {
             self.cancel_turn(cx);
@@ -2736,6 +2814,14 @@ impl Workspace {
             .border_color(theme.border)
             .bg(theme.surface)
             .child(panel_title(self.tr("project"), self.tr("files"), theme))
+            .when(self.project.is_some(), |this| {
+                this.child(
+                    div().px_3().pt_2().child(
+                        action_button(self.tr("new_file"), "project-new-file", false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.new_file_dialog(cx))),
+                    ),
+                )
+            })
             .when(self.project.is_none(), |this| {
                 this.child(
                     div().p_3().child(
@@ -3070,6 +3156,14 @@ impl Workspace {
             )
             .when(!self.audit.is_empty(), |this| {
                 this.child(self.audit_panel(theme))
+            })
+            .when(self.agent_paused, |this| {
+                this.child(
+                    div().mx_3().mb_2().child(
+                        action_button(self.tr("agent_continue"), "agent-continue", true, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.resume_agent(cx))),
+                    ),
+                )
             })
             .child(
                 div()
@@ -3485,18 +3579,27 @@ impl Workspace {
                     .text_color(theme.muted)
                     .child(self.tr("audit")),
             )
-            .children(self.audit.iter().rev().take(3).rev().cloned().map(|entry| {
+            .children(self.audit.iter().rev().take(3).rev().map(|entry| {
+                let summary = audit_preview(entry);
                 div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .truncate()
                     .text_xs()
                     .line_height(px(17.0))
                     .text_color(theme.faint)
-                    .child(entry)
+                    .child(summary)
                     .into_any_element()
             }))
     }
 
     fn status_bar(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let document = self.document.read(cx);
+        let status = if document.completion_failed() {
+            self.tr("completion_failed")
+        } else {
+            &self.status
+        };
         let (line, column) = document.cursor_line_col();
         let project = self
             .project
@@ -3536,7 +3639,7 @@ impl Workspace {
                     .flex_1()
                     .min_w(px(0.0))
                     .overflow_hidden()
-                    .child(self.status.clone()),
+                    .child(status.to_owned()),
             )
             .child(if self.state.focus_mode {
                 self.tr("focus_mode").into()
@@ -4727,6 +4830,33 @@ mod tests {
     }
 
     #[test]
+    fn new_file_accepts_custom_extensions_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!(
+            "aircode-create-file-{}-{}",
+            std::process::id(),
+            NEXT_CHAT_ENTRY_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("custom.unknown-extension");
+        assert_eq!(create_empty_file(path.clone()).unwrap(), path);
+        std::fs::write(&path, "keep").unwrap();
+        assert_eq!(
+            create_empty_file(path.clone()).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_agent_output_does_not_expand_the_activity_panel() {
+        let output = format!("{}\n{}", "а".repeat(1_000), "source code\n".repeat(10_000));
+        let preview = audit_preview(&output);
+        assert_eq!(preview.chars().count(), 180);
+        assert!(!preview.contains('\n'));
+    }
+
+    #[test]
     fn restored_message_ids_are_not_reused() {
         let original =
             PersistedChatMessage::new("chat-1000000000", PersistedMessageRole::User, "saved");
@@ -4899,6 +5029,60 @@ mod tests {
                 assert_eq!(workspace.chat[0].content, "first project");
                 assert_eq!(workspace.chat_input.read(cx).text(), "first draft");
                 assert_eq!(workspace.terminal.entity_id(), terminal);
+            })
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[gpui::test]
+    fn opening_projects_automatically_shows_and_reuses_their_terminals(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::terminal_view::TerminalStatus;
+
+        let root =
+            std::env::temp_dir().join(format!("aircode-automatic-terminal-{}", std::process::id()));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| Workspace::new_for_testing(cx));
+        cx.update(|_, app| {
+            view.update(app, |workspace, cx| {
+                workspace.open_project_path(first.clone(), cx);
+                let first_terminal = workspace.terminal.entity_id();
+                assert!(workspace.terminal_visible);
+                assert_eq!(
+                    workspace.terminal.read(cx).status(),
+                    TerminalStatus::Starting
+                );
+
+                workspace.toggle_terminal(cx);
+                workspace.open_project_path(second, cx);
+                assert!(workspace.terminal_visible);
+                assert_ne!(workspace.terminal.entity_id(), first_terminal);
+                assert_eq!(
+                    workspace.terminal.read(cx).status(),
+                    TerminalStatus::Starting
+                );
+
+                workspace.toggle_terminal(cx);
+                workspace.open_project_path(first.clone(), cx);
+                assert!(workspace.terminal_visible);
+                assert_eq!(workspace.terminal.entity_id(), first_terminal);
+                assert_eq!(
+                    workspace.terminal.read(cx).status(),
+                    TerminalStatus::Starting
+                );
+
+                workspace.toggle_terminal(cx);
+                workspace.open_project_path(first, cx);
+                assert!(workspace.terminal_visible);
+                assert_eq!(workspace.terminal.entity_id(), first_terminal);
+                assert_eq!(
+                    workspace.terminal.read(cx).status(),
+                    TerminalStatus::Starting
+                );
             })
         });
         std::fs::remove_dir_all(root).ok();

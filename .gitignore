@@ -3,3 +3,13 @@
 **/*.rs.bk
 *.log
 .DS_Store
+
+# Local credentials, private keys, and conversation attachments must not be
+# accidentally included in the repository. Already tracked files are unaffected.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+.codex-remote-attachments/

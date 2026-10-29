@@ -95,6 +95,10 @@ pub struct DocumentView {
     completion: Option<(u64, usize, String)>,
     completion_engine: Option<CompletionEngine>,
     completion_cancel: Option<CancellationToken>,
+    completion_failed: bool,
+    completion_generation: u64,
+    completion_refresh: bool,
+    completion_focus: Option<gpui::Subscription>,
     completion_blur: Option<gpui::Subscription>,
 }
 
@@ -127,6 +131,10 @@ impl DocumentView {
             completion: None,
             completion_engine: None,
             completion_cancel: None,
+            completion_failed: false,
+            completion_generation: 0,
+            completion_refresh: false,
+            completion_focus: None,
             completion_blur: None,
         }
     }
@@ -146,21 +154,50 @@ impl DocumentView {
         if self.completion_engine.as_ref().map(|engine| &engine.config)
             == engine.as_ref().map(|engine| &engine.config)
         {
+            self.completion_engine = engine;
             return;
         }
         self.cancel_completion();
         self.completion_engine = engine;
+        self.completion_failed = false;
+        self.completion_refresh = self.completion_engine.is_some();
+    }
+
+    pub(crate) fn completion_failed(&self) -> bool {
+        self.completion_failed
     }
 
     fn cancel_completion(&mut self) {
+        self.completion_generation = self.completion_generation.wrapping_add(1);
         if let Some(cancel) = self.completion_cancel.take() {
             cancel.cancel();
         }
         self.completion = None;
     }
 
+    fn watch_completion_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.completion_focus.is_none() {
+            let focus = self.focus_handle.clone();
+            self.completion_focus = Some(cx.on_focus(&focus, window, |view, _, cx| {
+                view.completion_refresh = true;
+                cx.notify();
+            }));
+        }
+        if self.completion_blur.is_none() {
+            let focus = self.focus_handle.clone();
+            self.completion_blur = Some(cx.on_blur(&focus, window, |view, _, cx| {
+                view.completion_refresh = false;
+                view.revision = view.revision.wrapping_add(1);
+                view.cancel_completion();
+                cx.notify();
+            }));
+        }
+    }
+
     fn schedule_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.watch_completion_focus(window, cx);
         self.cancel_completion();
+        self.completion_refresh = false;
         let Some(engine) = self.completion_engine.clone() else {
             return;
         };
@@ -170,14 +207,8 @@ impl DocumentView {
         if !self.focus_handle.is_focused(window) {
             return;
         }
-        if self.completion_blur.is_none() {
-            let focus = self.focus_handle.clone();
-            self.completion_blur = Some(cx.on_blur(&focus, window, |view, _, cx| {
-                view.revision = view.revision.wrapping_add(1);
-                view.cancel_completion();
-                cx.notify();
-            }));
-        }
+        self.completion_failed = false;
+        let generation = self.completion_generation;
         let cancel = CancellationToken::new();
         self.completion_cancel = Some(cancel.clone());
         cx.spawn_in(window, async move |view, cx| {
@@ -187,14 +218,17 @@ impl DocumentView {
             if cancel.is_cancelled() {
                 return;
             }
-            let still_focused = view
+            let should_request = view
                 .update_in(cx, |view, window, _| {
-                    view.focus_handle.is_focused(window)
-                        && view.revision == revision
-                        && !view.read_only
+                    let current = view.focus_handle.is_focused(window)
+                        && view.completion_is_current(revision, cursor);
+                    if !current && view.completion_generation == generation {
+                        view.completion_cancel = None;
+                    }
+                    current
                 })
                 .unwrap_or(false);
-            if !still_focused {
+            if !should_request {
                 return;
             }
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -210,25 +244,42 @@ impl DocumentView {
                         request_cancel,
                     )
                     .await
-                    .ok(),
-                    _ => None,
+                    .map(Some),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
                 };
                 let _ = sender.send(result);
             });
-            if let Some(result) = receiver.recv().await
-                && !cancel.is_cancelled()
-            {
-                let _ = view.update_in(cx, |view, window, cx| {
-                    if view.revision == revision && view.document.selection() == (cursor..cursor) {
-                        view.completion_cancel = None;
-                        if let Some(text) = result
-                            && view.focus_handle.is_focused(window)
-                        {
-                            view.set_completion(revision, cursor, &text, cx);
-                        }
+            let result = receiver.recv().await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                if view.completion_generation != generation {
+                    return;
+                }
+                view.completion_cancel = None;
+                if cancel.is_cancelled()
+                    || !view.focus_handle.is_focused(window)
+                    || !view.completion_is_current(revision, cursor)
+                {
+                    return;
+                }
+                match result {
+                    Some(Ok(Some(text))) => {
+                        view.set_completion(revision, cursor, &text, cx);
                     }
-                });
-            }
+                    Some(Ok(None)) => {
+                        view.completion_failed = true;
+                        cx.notify();
+                    }
+                    Some(Err(_)) => {
+                        view.completion_failed = true;
+                        cx.notify();
+                    }
+                    None => {
+                        view.completion_failed = true;
+                        cx.notify();
+                    }
+                }
+            });
         })
         .detach();
     }
@@ -249,6 +300,15 @@ impl DocumentView {
     }
 
     pub fn completion_context(&self) -> Option<(u64, usize, Vec<aircode_ai::ChatMessage>)> {
+        let cursor = self.completion_cursor()?;
+        let language = self
+            .detected_language()
+            .map_or("text", |language| language.label());
+        let messages = aircode_ai::completion_messages(self.document.text(), cursor, language)?;
+        Some((self.revision, cursor, messages))
+    }
+
+    fn completion_cursor(&self) -> Option<usize> {
         let selection = self.document.selection();
         if self.read_only || self.marked_range.is_some() || !selection.is_empty() {
             return None;
@@ -258,11 +318,11 @@ impl DocumentView {
         if cursor != self.document.line_range(line).end {
             return None;
         }
-        let language = self
-            .detected_language()
-            .map_or("text", |language| language.label());
-        let messages = aircode_ai::completion_messages(self.document.text(), cursor, language)?;
-        Some((self.revision, cursor, messages))
+        Some(cursor)
+    }
+
+    fn completion_is_current(&self, revision: u64, cursor: usize) -> bool {
+        self.revision == revision && self.completion_cursor() == Some(cursor)
     }
 
     pub fn set_completion(
@@ -272,15 +332,10 @@ impl DocumentView {
         text: &str,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only
-            || self.marked_range.is_some()
-            || self.revision != revision
-            || self.document.selection() != (cursor..cursor)
-        {
+        if !self.completion_is_current(revision, cursor) {
             return;
         }
-        let line = text.lines().next().unwrap_or("");
-        if !line.is_empty() && !line.starts_with("```") {
+        if let Some(line) = inline_completion_line(text) {
             let mut end = line.len().min(4096);
             while !line.is_char_boundary(end) {
                 end -= 1;
@@ -550,9 +605,10 @@ impl DocumentView {
     }
 
     fn tab(&mut self, _: &InsertTab, window: &mut Window, cx: &mut Context<Self>) {
-        let suggestion = self.completion.take().filter(|(revision, cursor, _)| {
-            *revision == self.revision && self.document.selection() == (*cursor..*cursor)
-        });
+        let suggestion = self
+            .completion
+            .take()
+            .filter(|(revision, cursor, _)| self.completion_is_current(*revision, *cursor));
         self.replace_text_in_range(
             None,
             suggestion
@@ -837,8 +893,9 @@ impl EntityInputHandler for DocumentView {
             .map(|range| self.range_to_utf16(range))
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.marked_range = None;
+        self.schedule_completion(window, cx);
     }
 
     fn replace_text_in_range(
@@ -909,6 +966,9 @@ impl EntityInputHandler for DocumentView {
                 .document
                 .set_selection(insertion_start + start..insertion_start + end);
         }
+        // replace_text_in_range runs before the marked range is installed.
+        // Do not let that intermediate state start an IME completion request.
+        self.cancel_completion();
         cx.notify();
     }
 
@@ -1150,9 +1210,7 @@ impl Element for DocumentElement {
             if cursor >= range.start && cursor <= range.end {
                 let cursor_x = line.x_for_index(cursor - range.start);
                 if let Some((revision, offset, suggestion)) = &input.completion
-                    && *revision == input.revision
-                    && *offset == cursor
-                    && selection.is_empty()
+                    && input.completion_is_current(*revision, *offset)
                 {
                     let run = TextRun {
                         len: suggestion.len(),
@@ -1348,8 +1406,27 @@ fn highlight_color(kind: HighlightKind) -> gpui::Hsla {
     }
 }
 
+fn inline_completion_line(text: &str) -> Option<&str> {
+    let mut lines = text.lines();
+    let first = lines.next()?;
+    let line = if first.trim_start().starts_with("```") {
+        lines.next()?
+    } else {
+        first
+    };
+    if line.trim().is_empty() || line.trim_start().starts_with("```") {
+        None
+    } else {
+        Some(line)
+    }
+}
+
 impl Render for DocumentView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.watch_completion_focus(window, cx);
+        if std::mem::take(&mut self.completion_refresh) {
+            self.schedule_completion(window, cx);
+        }
         div()
             .relative()
             .size_full()
@@ -1433,6 +1510,50 @@ mod tests {
                 assert_eq!(document.document().text(), "fn ");
             })
         });
+    }
+
+    #[gpui::test]
+    fn completion_rejects_midline_ime_and_accepts_fenced_code(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| DocumentView::new(cx));
+        cx.update(|_, app| {
+            view.update(app, |document, cx| {
+                document.set_document(Document::from_text("fn main() {}"), cx);
+                document.document_mut().set_selection(2..2).unwrap();
+                let revision = document.revision;
+                assert!(document.completion_context().is_none());
+                document.set_completion(revision, 2, "stale", cx);
+                assert!(document.completion.is_none());
+
+                document.move_to(12, cx);
+                let (revision, cursor, _) = document.completion_context().unwrap();
+                document.marked_range = Some(0..2);
+                document.set_completion(revision, cursor, "stale", cx);
+                assert!(document.completion.is_none());
+
+                document.marked_range = None;
+                document.set_completion(revision, cursor, "```rust\n// done\n```", cx);
+                assert_eq!(
+                    document
+                        .completion
+                        .as_ref()
+                        .map(|(_, _, text)| text.as_str()),
+                    Some("// done")
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn inline_completion_is_a_nonempty_single_safe_line() {
+        assert_eq!(inline_completion_line("value\nignored"), Some("value"));
+        assert_eq!(
+            inline_completion_line("  ```rust\nvalue\n```"),
+            Some("value")
+        );
+        assert_eq!(inline_completion_line("\nvalue"), None);
+        assert_eq!(inline_completion_line("   \nvalue"), None);
+        assert_eq!(inline_completion_line("```rust\n```"), None);
+        assert_eq!(inline_completion_line(""), None);
     }
 
     #[test]

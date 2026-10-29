@@ -111,7 +111,15 @@ impl TerminalView {
             cx.notify();
             return;
         };
-        let command = system_shell_command(&cwd);
+        let command = match system_shell_command(&cwd) {
+            Ok(command) => command,
+            Err(error) => {
+                self.status = TerminalStatus::Failed;
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
         let config = TerminalConfig::new(command);
         self.status = TerminalStatus::Starting;
         cx.notify();
@@ -727,16 +735,55 @@ fn terminal_color(color: TerminalColor, default: gpui::Hsla) -> gpui::Hsla {
     }
 }
 
-fn system_shell_command(cwd: &Path) -> ProcessCommand {
+fn system_shell_command(cwd: &Path) -> Result<ProcessCommand, String> {
     #[cfg(windows)]
-    let shell = std::env::var_os("COMSPEC")
-        .filter(|shell| !shell.is_empty())
-        .unwrap_or_else(|| OsString::from("cmd.exe"));
+    {
+        let cwd = windows_shell_path(cwd)?;
+        if cwd.as_os_str().to_string_lossy().starts_with(r"\\") {
+            // cmd.exe cannot use a UNC path as its current directory. Start
+            // PowerShell from a local directory and switch its provider path.
+            let path = cwd.to_str().ok_or("Project path is not valid Unicode")?;
+            let command = format!("Set-Location -LiteralPath '{}'", path.replace('\'', "''"));
+            let local = std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\"));
+            return Ok(ProcessCommand::new("powershell.exe", local)
+                .args(["-NoLogo", "-NoExit", "-Command"])
+                .arg(command));
+        }
+        let shell = std::env::var_os("COMSPEC")
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| OsString::from("cmd.exe"));
+        Ok(ProcessCommand::new(shell, cwd))
+    }
     #[cfg(not(windows))]
-    let shell = std::env::var_os("SHELL")
-        .filter(|shell| !shell.is_empty())
-        .unwrap_or_else(|| OsString::from("/bin/sh"));
-    ProcessCommand::new(shell, cwd)
+    {
+        let shell = std::env::var_os("SHELL")
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| OsString::from("/bin/sh"));
+        Ok(ProcessCommand::new(shell, cwd))
+    }
+}
+
+#[cfg(windows)]
+fn windows_shell_path(path: &Path) -> Result<PathBuf, String> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
+    if !wide.starts_with(&prefix) {
+        return Ok(path.to_owned());
+    }
+    let suffix = &wide[prefix.len()..];
+    let unc: Vec<u16> = "UNC\\".encode_utf16().collect();
+    if suffix.starts_with(&unc) {
+        let mut normal = vec![b'\\' as u16, b'\\' as u16];
+        normal.extend_from_slice(&suffix[unc.len()..]);
+        return Ok(PathBuf::from(OsString::from_wide(&normal)));
+    }
+    if suffix.len() >= 3 && suffix[1] == b':' as u16 && suffix[2] == b'\\' as u16 {
+        return Ok(PathBuf::from(OsString::from_wide(suffix)));
+    }
+    Err("Unsupported Windows project path for terminal".into())
 }
 
 fn terminal_font() -> &'static str {
@@ -848,6 +895,52 @@ fn utf16_to_byte(text: &str, offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_uses_the_project_directory_after_canonicalization() {
+        let project = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let expected = windows_shell_path(&project)
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
+        let config = TerminalConfig::new(system_shell_command(&project).unwrap())
+            .with_size(TerminalSize::new(24, 200).unwrap());
+        let (terminal, _updates) = Terminal::spawn(config).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let snapshot = terminal.snapshot();
+            let text = (0..snapshot.size.rows())
+                .filter_map(|row| snapshot.row_text(row))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_lowercase();
+            if text.contains(&expected) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal did not open in the project directory: {text}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        terminal
+            .close_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_paths_handle_extended_drive_and_network_prefixes() {
+        assert_eq!(
+            windows_shell_path(Path::new(r"\\?\D:\project")).unwrap(),
+            PathBuf::from(r"D:\project")
+        );
+        assert_eq!(
+            windows_shell_path(Path::new(r"\\?\UNC\server\share\project")).unwrap(),
+            PathBuf::from(r"\\server\share\project")
+        );
+    }
 
     const CTRL: Modifiers = Modifiers {
         shift: false,

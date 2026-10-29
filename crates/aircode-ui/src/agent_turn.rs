@@ -139,6 +139,15 @@ impl AgentTurn {
         self.active = None;
     }
 
+    /// Start another bounded batch without losing pending tool calls or their results.
+    pub fn resume(&mut self) -> bool {
+        if self.active.is_some() || self.pending.is_empty() {
+            return false;
+        }
+        self.steps = 0;
+        true
+    }
+
     pub fn request_messages(&self) -> Result<Vec<ChatMessage>, String> {
         bounded_context(&self.messages)
     }
@@ -346,6 +355,23 @@ mod tests {
         assert_eq!(turn.steps(), MAX_AGENT_STEPS);
         tool_response(&mut turn, vec![call("over-limit")]);
         assert_eq!(turn.next_tool(), NextTool::StepLimit);
+
+        assert!(turn.resume());
+        let NextTool::Execute(resumed) = turn.next_tool() else {
+            panic!("pending call lost")
+        };
+        assert_eq!(resumed.id, "over-limit");
+        turn.complete_tool(&resumed.id, "resumed".into()).unwrap();
+        assert_eq!(turn.next_tool(), NextTool::FollowUp);
+        assert_eq!(
+            turn.request_messages()
+                .unwrap()
+                .last()
+                .unwrap()
+                .tool_call_id
+                .as_deref(),
+            Some("over-limit")
+        );
 
         turn.begin(vec![ChatMessage::user("Independent second turn")]);
         assert_eq!(turn.steps(), 0);

@@ -354,7 +354,8 @@ fn protected(name: &str) -> bool {
             | "build"
             | ".idea"
             | ".vscode"
-    ) || name.ends_with(".env")
+    ) || name.starts_with(".env.")
+        || name.ends_with(".env")
         || name.ends_with(".pem")
         || name.ends_with(".key")
         || name.contains("credential")
@@ -424,7 +425,14 @@ mod tests {
         };
         assert!(executor.execute(&read).await.unwrap().contains("fn main"));
 
-        for path in ["../outside.txt", ".env", ".git/config", "src/private.pem"] {
+        for path in [
+            "../outside.txt",
+            ".env",
+            ".env.production",
+            "src/.env.local",
+            ".git/config",
+            "src/private.pem",
+        ] {
             let action = AgentAction {
                 name: "read_file".into(),
                 arguments: format!("{{\"path\":\"{path}\"}}"),

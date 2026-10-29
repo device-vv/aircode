@@ -118,6 +118,10 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::English, "key_saved") => "Key saved",
         (Language::English, "no_key_saved") => "No key saved",
         (Language::English, "include_document") => "Include document or selection in chat",
+        (Language::English, "new_file") => "New file…",
+        (Language::English, "completion_failed") => {
+            "AI completion failed: check provider, model and API key"
+        }
         (Language::English, "inline_completion") => {
             "AI code completion (sends code; may incur costs)"
         }
@@ -154,7 +158,10 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::English, "cancelling") => "Cancelling...",
         (Language::English, "cancelled") => "Cancelled",
         (Language::English, "sandbox_error") => "Cannot initialize project sandbox",
-        (Language::English, "agent_step_limit") => "Agent stopped after 8 tool steps",
+        (Language::English, "agent_step_limit") => {
+            "Agent paused after 8 actions. Continue to resume."
+        }
+        (Language::English, "agent_continue") => "Continue agent",
         (Language::English, "command_palette") => "Select a command",
         (Language::English, "palette_filter") => "Type a command...",
         (Language::English, "no_commands") => "No matching commands",
@@ -260,6 +267,10 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::Russian, "key_saved") => "Ключ сохранён",
         (Language::Russian, "no_key_saved") => "Ключ не сохранён",
         (Language::Russian, "include_document") => "Передавать документ или выделение в чат",
+        (Language::Russian, "new_file") => "Создать файл…",
+        (Language::Russian, "completion_failed") => {
+            "Ошибка подсказок ИИ: проверьте провайдера, модель и ключ"
+        }
         (Language::Russian, "inline_completion") => {
             "Подсказки кода ИИ (код отправляется провайдеру; возможна оплата)"
         }
@@ -296,7 +307,10 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::Russian, "cancelling") => "Останавливаю...",
         (Language::Russian, "cancelled") => "Остановлено",
         (Language::Russian, "sandbox_error") => "Не удалось настроить защищённую область проекта",
-        (Language::Russian, "agent_step_limit") => "Агент остановлен после 8 вызовов инструментов",
+        (Language::Russian, "agent_step_limit") => {
+            "Агент приостановлен после 8 действий. Нажмите «Продолжить»."
+        }
+        (Language::Russian, "agent_continue") => "Продолжить работу агента",
         (Language::Russian, "command_palette") => "Выберите команду",
         (Language::Russian, "palette_filter") => "Введите команду...",
         (Language::Russian, "no_commands") => "Нет подходящих команд",

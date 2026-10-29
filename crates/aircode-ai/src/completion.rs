@@ -159,11 +159,15 @@ pub async fn request_completion(
 }
 
 fn append_completion(result: &mut String, event: StreamEvent) -> Result<(), AiError> {
-    if let StreamEvent::ContentDelta(text) = event {
-        if result.len().saturating_add(text.len()) > 32_768 {
-            return Err(AiError::Protocol("Inline completion exceeds 32 KiB".into()));
+    match event {
+        StreamEvent::ContentDelta(text) => {
+            if result.len().saturating_add(text.len()) > 32_768 {
+                return Err(AiError::Protocol("Inline completion exceeds 32 KiB".into()));
+            }
+            result.push_str(&text);
         }
-        result.push_str(&text);
+        StreamEvent::Error(message) => return Err(AiError::Protocol(message)),
+        _ => {}
     }
     Ok(())
 }
@@ -190,6 +194,13 @@ mod tests {
         .unwrap();
         append_completion(&mut result, StreamEvent::ContentDelta("actual code".into())).unwrap();
         assert_eq!(result, "actual code");
+        assert!(
+            append_completion(
+                &mut result,
+                StreamEvent::Error("mock stream failure".into()),
+            )
+            .is_err()
+        );
         assert!(
             append_completion(&mut result, StreamEvent::ContentDelta("x".repeat(32768))).is_err()
         );
@@ -261,6 +272,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result, "hello!");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_stream_error_does_not_return_partial_code() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 8192];
+            let mut request = Vec::new();
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "request closed before its body was received");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                "data: {\"error\":{\"message\":\"mock stream failure\"}}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut config = ProviderConfig::new(crate::ProviderKind::DeepSeek);
+        config.base_url = format!("http://{address}");
+        let error = request_completion(
+            &AiClient::new().unwrap(),
+            &config,
+            &ApiKey::new("test-key".into()).unwrap(),
+            &completion_messages("let x = ", 8, "Rust").unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AiError::Protocol(message) if message == "mock stream failure"
+        ));
         server.await.unwrap();
     }
 
