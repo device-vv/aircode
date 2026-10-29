@@ -33,7 +33,7 @@ The executable is portable and currently **unsigned**, so Windows SmartScreen ma
 - English and Russian interfaces. English is the default; Russian-system users are offered a one-time language switch.
 - Streaming AI chat with collapsible reasoning, cancellation, message copying, and context menus for cut/copy/paste/select all.
 - Optional document or selection context, limited to 200 KB per request.
-- Project agent tools: list, read, search, write, create directories, move, delete, and run commands. The agent is limited to eight tool steps per user message; bounded results explicitly identify incomplete project inspection.
+- Project agent tools: list, read, search, write, create directories, move, delete, and run commands. The agent continues until it finishes or is stopped; bounded results explicitly identify incomplete project inspection.
 - Three permission modes: **Ask every action**, **Ask important only**, and **Full access**. Approval includes the tool arguments and a diff for file writes. An activity log records tool calls and results.
 - Light and dark themes, native Kimi Code support, and custom OpenAI-compatible providers.
 
@@ -185,7 +185,7 @@ AIRcode объединяет нативный GPUI-редактор, дерев�
 - Английский и русский интерфейсы. По умолчанию английский; при русской системе предлагается однократное переключение.
 - Потоковый чат, сворачиваемые рассуждения, остановка, копирование сообщений и контекстное меню вырезания/копирования/вставки/выделения.
 - Контекст документа или выделения по выбору пользователя, до 200 КБ на запрос.
-- Инструменты агента: список, чтение, поиск, запись, создание папок, перемещение, удаление и команды. Не более восьми шагов за сессию.
+- Инструменты агента: список, чтение, поиск, запись, создание папок, перемещение, удаление и команды. Агент работает до завершения или остановки пользователем.
 - Три режима: **Спрашивать каждое действие**, **Спрашивать только важное**, **Полный доступ**. Перед записью показываются аргументы и diff. Журнал содержит вызовы и результаты.
 - Светлая и тёмная темы, нативный Kimi Code и пользовательские OpenAI-совместимые провайдеры.
 

@@ -75,14 +75,20 @@ fn create_empty_file(path: PathBuf) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-fn audit_preview(entry: &str) -> String {
-    entry
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(180)
-        .collect()
+fn audit_detail(entry: &str) -> String {
+    let mut end = entry.len().min(4096);
+    while !entry.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < entry.len() {
+        format!("{}…", &entry[..end])
+    } else {
+        entry.to_owned()
+    }
+}
+
+fn chat_entry_visible(entry: &ChatEntry) -> bool {
+    entry.state != ChatEntryState::ToolsComplete || !entry.content.trim().is_empty()
 }
 
 fn language_tools_status(
@@ -338,7 +344,8 @@ impl ChatEntryState {
     fn restored(value: &str) -> Self {
         match value {
             "complete" => Self::Complete,
-            "cancelled" | "active" | "tools_complete" => Self::Cancelled,
+            "cancelled" | "active" => Self::Cancelled,
+            "tools_complete" => Self::ToolsComplete,
             "failed" => Self::Failed,
             _ => Self::Complete,
         }
@@ -661,7 +668,8 @@ pub struct Workspace {
     settings_store: Option<SettingsStore>,
     permission: PermissionMode,
     agent_turn: AgentTurn,
-    agent_paused: bool,
+    audit_expanded: bool,
+    chat_scroll: ScrollHandle,
     current_config: ProviderConfig,
     pending_tool: Option<(ToolCall, Option<String>)>,
     tool_running: bool,
@@ -817,7 +825,8 @@ impl Workspace {
             overlay_was_open: false,
             permission: PermissionMode::from_code(&settings.permission_mode),
             agent_turn: AgentTurn::default(),
-            agent_paused: false,
+            audit_expanded: false,
+            chat_scroll: ScrollHandle::new(),
             current_config: settings.provider.clone(),
             pending_tool: None,
             tool_running: false,
@@ -1511,7 +1520,6 @@ impl Workspace {
                     self.terminal
                         .update(cx, |terminal, _| terminal.set_language(self.language));
                     self.agent_turn.cancel();
-                    self.agent_paused = false;
                     self.audit.clear();
                 }
                 self.project = Some(project);
@@ -1834,7 +1842,6 @@ impl Workspace {
         self.chat_input.update(cx, |input, cx| input.clear(cx));
         self.history_suspend -= 1;
         self.agent_turn.cancel();
-        self.agent_paused = false;
         self.agent_turn.begin(Vec::new());
         self.audit.clear();
         self.status = self.tr("new_session").into();
@@ -1842,7 +1849,6 @@ impl Workspace {
     }
 
     fn cancel_turn(&mut self, cx: &mut Context<Self>) {
-        self.agent_paused = false;
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }
@@ -1862,7 +1868,6 @@ impl Workspace {
     }
 
     fn fail_turn(&mut self, error: String, cx: &mut Context<Self>) {
-        self.agent_paused = false;
         if let Some(entry) = self.chat.last_mut()
             && entry.role == MessageRole::Assistant
         {
@@ -1994,7 +1999,6 @@ impl Workspace {
             request_messages.push(ChatMessage::system(PROJECT_CONTEXT_INSTRUCTIONS));
         }
         request_messages.push(ChatMessage::user(outbound));
-        self.agent_paused = false;
         self.agent_turn.begin(request_messages);
         let request_messages = match self.agent_turn.request_messages() {
             Ok(messages) => messages,
@@ -2014,6 +2018,7 @@ impl Workspace {
             String::new(),
             ChatEntryState::Active,
         ));
+        self.chat_scroll.scroll_to_bottom();
         self.chat_input.update(cx, |input, cx| input.clear(cx));
         self.generation += 1;
         let generation = self.generation;
@@ -2057,6 +2062,8 @@ impl Workspace {
         if generation != self.generation {
             return;
         }
+        let was_near_bottom =
+            -self.chat_scroll.offset().y + px(32.0) >= self.chat_scroll.max_offset().height;
         match event {
             StreamEvent::ReasoningDelta(delta) => {
                 self.agent_turn.push_reasoning(&delta);
@@ -2140,6 +2147,9 @@ impl Workspace {
                 }
             },
         }
+        if was_near_bottom {
+            self.chat_scroll.scroll_to_bottom();
+        }
         cx.notify();
     }
 
@@ -2161,21 +2171,7 @@ impl Workspace {
                 }
             }
             NextTool::FollowUp => self.start_followup(cx),
-            NextTool::StepLimit => {
-                self.streaming = false;
-                self.agent_paused = true;
-                self.status = self.tr("agent_step_limit").to_string();
-                self.persist_history(cx);
-                cx.notify();
-            }
-        }
-    }
-
-    fn resume_agent(&mut self, cx: &mut Context<Self>) {
-        if self.agent_paused && self.agent_turn.resume() {
-            self.agent_paused = false;
-            self.streaming = true;
-            self.continue_agent(cx);
+            NextTool::Busy => {}
         }
     }
 
@@ -2408,7 +2404,6 @@ impl Workspace {
     }
 
     fn provider_changed(&mut self, cx: &mut Context<Self>) {
-        self.agent_paused = false;
         self.invalidate_summary();
         if self.streaming || self.pending_tool.is_some() {
             self.cancel_turn(cx);
@@ -3127,6 +3122,7 @@ impl Workspace {
             .child(
                 div()
                     .id("chat-scroll")
+                    .track_scroll(&self.chat_scroll)
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -3144,6 +3140,7 @@ impl Workspace {
                             .iter()
                             .cloned()
                             .enumerate()
+                            .filter(|(_, entry)| chat_entry_visible(entry))
                             .map(|(index, entry)| {
                                 let waiting = streaming
                                     && index == last
@@ -3155,15 +3152,7 @@ impl Workspace {
                     }),
             )
             .when(!self.audit.is_empty(), |this| {
-                this.child(self.audit_panel(theme))
-            })
-            .when(self.agent_paused, |this| {
-                this.child(
-                    div().mx_3().mb_2().child(
-                        action_button(self.tr("agent_continue"), "agent-continue", true, theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.resume_agent(cx))),
-                    ),
-                )
+                this.child(self.audit_panel(theme, cx))
             })
             .child(
                 div()
@@ -3562,7 +3551,7 @@ impl Workspace {
             )
     }
 
-    fn audit_panel(&self, theme: Theme) -> impl IntoElement {
+    fn audit_panel(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -3574,23 +3563,46 @@ impl Workspace {
             .bg(theme.raised)
             .child(
                 div()
+                    .id("toggle-agent-actions")
+                    .debug_selector(|| "toggle-agent-actions".to_string())
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.audit_expanded = !this.audit_expanded;
+                        cx.notify();
+                    }))
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.muted)
-                    .child(self.tr("audit")),
+                    .child(format!(
+                        "{}  {}",
+                        self.tr("audit"),
+                        if self.audit_expanded { "▾" } else { "▸" }
+                    )),
             )
-            .children(self.audit.iter().rev().take(3).rev().map(|entry| {
-                let summary = audit_preview(entry);
-                div()
-                    .w_full()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_xs()
-                    .line_height(px(17.0))
-                    .text_color(theme.faint)
-                    .child(summary)
-                    .into_any_element()
-            }))
+            .when(self.audit_expanded, |this| {
+                this.child(
+                    div()
+                        .id("agent-actions-scroll")
+                        .debug_selector(|| "agent-actions-scroll".to_string())
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .max_h(px(160.0))
+                        .overflow_y_scroll()
+                        .children(self.audit.iter().map(|entry| {
+                            let detail = audit_detail(entry);
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .whitespace_normal()
+                                .text_xs()
+                                .line_height(px(17.0))
+                                .text_color(theme.faint)
+                                .child(detail)
+                                .into_any_element()
+                        })),
+                )
+            })
     }
 
     fn status_bar(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4788,6 +4800,14 @@ mod tests {
         new_chat_entry(role, content.into(), state)
     }
 
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: format!("{{\"path\":\"{id}.rs\"}}"),
+        }
+    }
+
     #[test]
     fn empty_replies_have_localized_terminal_states() {
         let active = entry(MessageRole::Assistant, "", ChatEntryState::Active);
@@ -4813,6 +4833,28 @@ mod tests {
     }
 
     #[test]
+    fn tool_only_messages_are_hidden_but_model_text_remains_visible() {
+        let tool_only = entry(MessageRole::Assistant, "", ChatEntryState::ToolsComplete);
+        assert!(!chat_entry_visible(&tool_only));
+        let text_with_tool = entry(
+            MessageRole::Assistant,
+            "Проверяю проект",
+            ChatEntryState::ToolsComplete,
+        );
+        assert!(chat_entry_visible(&text_with_tool));
+        assert_eq!(
+            chat_display_content(&text_with_tool, false, Language::Russian),
+            "Проверяю проект"
+        );
+        let final_empty = entry(MessageRole::Assistant, "", ChatEntryState::Complete);
+        assert!(chat_entry_visible(&final_empty));
+        assert_eq!(
+            ChatEntryState::restored("tools_complete"),
+            ChatEntryState::ToolsComplete
+        );
+    }
+
+    #[test]
     fn request_history_excludes_unusable_assistant_entries() {
         let history = vec![
             entry(MessageRole::User, "question", ChatEntryState::Complete),
@@ -4827,6 +4869,158 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "question");
         assert_eq!(messages[1].content, "answer");
+    }
+
+    #[gpui::test]
+    fn streamed_deltas_become_complete_chat_and_request_text(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| Workspace::new_for_testing(cx));
+        cx.update(|_, app| {
+            view.update(app, |workspace, cx| {
+                workspace.generation = 4;
+                workspace.streaming = true;
+                workspace.chat.push(entry(
+                    MessageRole::User,
+                    "Explain this code",
+                    ChatEntryState::Complete,
+                ));
+                workspace
+                    .chat
+                    .push(entry(MessageRole::Assistant, "", ChatEntryState::Active));
+                workspace
+                    .agent_turn
+                    .begin(vec![ChatMessage::user("Explain this code")]);
+                workspace.agent_turn.begin_response();
+
+                workspace.handle_stream_event(
+                    4,
+                    StreamEvent::ReasoningDelta("Checking the code".into()),
+                    cx,
+                );
+                workspace.handle_stream_event(4, StreamEvent::ContentDelta("Final ".into()), cx);
+                workspace.handle_stream_event(4, StreamEvent::ContentDelta("answer".into()), cx);
+                assert_eq!(workspace.chat[1].content, "Final answer");
+                assert_eq!(workspace.chat[1].state, ChatEntryState::Active);
+                assert!(workspace.streaming);
+
+                workspace.handle_stream_event(4, StreamEvent::Done, cx);
+
+                assert_eq!(workspace.chat[1].content, "Final answer");
+                assert_eq!(workspace.chat[1].reasoning, "Checking the code");
+                assert_eq!(workspace.chat[1].state, ChatEntryState::Complete);
+                assert!(chat_entry_visible(&workspace.chat[1]));
+                assert!(!workspace.streaming);
+                assert!(workspace.cancel.is_none());
+                let messages = workspace.agent_turn.request_messages().unwrap();
+                assert_eq!(messages.last().unwrap().content, "Final answer");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn stop_button_cancels_and_ignores_late_stream_events(cx: &mut gpui::TestAppContext) {
+        use gpui::{AvailableSpace, Modifiers, size};
+
+        let (view, cx) = cx.add_window_view(|_, cx| Workspace::new_for_testing(cx));
+        let cancel = CancellationToken::new();
+        cx.update(|_, app| {
+            view.update(app, |workspace, cx| {
+                workspace.generation = 9;
+                workspace.streaming = true;
+                workspace.tool_running = true;
+                workspace.cancel = Some(cancel.clone());
+                workspace
+                    .chat
+                    .push(entry(MessageRole::Assistant, "", ChatEntryState::Active));
+                workspace
+                    .agent_turn
+                    .begin(vec![ChatMessage::user("Inspect the project")]);
+                workspace.agent_turn.begin_response();
+                workspace.handle_stream_event(9, StreamEvent::ContentDelta("partial".into()), cx);
+            });
+        });
+        cx.simulate_resize(size(px(960.0), px(640.0)));
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(
+                AvailableSpace::Definite(px(960.0)),
+                AvailableSpace::Definite(px(640.0)),
+            ),
+            |_, _| view.clone().into_any_element(),
+        );
+        let stop = cx.debug_bounds("send-button").unwrap();
+        cx.simulate_click(
+            point(
+                stop.left() + stop.size.width / 2.0,
+                stop.top() + stop.size.height / 2.0,
+            ),
+            Modifiers::default(),
+        );
+
+        assert!(cancel.is_cancelled());
+        cx.update(|_, app| {
+            view.update(app, |workspace, cx| {
+                assert!(!workspace.streaming);
+                assert!(!workspace.tool_running);
+                assert!(workspace.cancel.is_none());
+                assert_eq!(workspace.chat[0].state, ChatEntryState::Cancelled);
+                assert_eq!(workspace.chat[0].content, "partial");
+
+                workspace.handle_stream_event(9, StreamEvent::ContentDelta(" late".into()), cx);
+                workspace.handle_stream_event(9, StreamEvent::Done, cx);
+                assert_eq!(workspace.chat[0].content, "partial");
+                assert_eq!(workspace.chat[0].state, ChatEntryState::Cancelled);
+                assert!(!workspace.streaming);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn tool_results_continue_automatically_past_eight_actions(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| Workspace::new_for_testing(cx));
+        cx.update(|_, app| {
+            view.update(app, |workspace, cx| {
+                const TOOL_COUNT: usize = 12;
+
+                workspace.generation = 2;
+                workspace.streaming = true;
+                workspace.permission = PermissionMode::AskEvery;
+                workspace
+                    .chat
+                    .push(entry(MessageRole::Assistant, "", ChatEntryState::Active));
+                workspace
+                    .agent_turn
+                    .begin(vec![ChatMessage::user("Inspect the project")]);
+                workspace.agent_turn.begin_response();
+                let calls = (0..TOOL_COUNT)
+                    .map(|index| tool_call(&format!("call-{index}")))
+                    .collect();
+                workspace.handle_stream_event(2, StreamEvent::ToolCalls(calls), cx);
+                workspace.handle_stream_event(2, StreamEvent::Done, cx);
+
+                for index in 0..TOOL_COUNT {
+                    let (call, _) = workspace
+                        .pending_tool
+                        .take()
+                        .unwrap_or_else(|| panic!("missing automatic continuation at {index}"));
+                    assert_eq!(call.id, format!("call-{index}"));
+                    assert!(workspace.streaming);
+                    if index + 1 < TOOL_COUNT {
+                        workspace.handle_stream_event(
+                            2,
+                            StreamEvent::ToolResult {
+                                call_id: call.id,
+                                result: "mock result".into(),
+                            },
+                            cx,
+                        );
+                    }
+                }
+
+                assert_eq!(workspace.chat[0].state, ChatEntryState::ToolsComplete);
+                assert!(!chat_entry_visible(&workspace.chat[0]));
+                workspace.cancel_turn(cx);
+            });
+        });
     }
 
     #[test]
@@ -4851,9 +5045,55 @@ mod tests {
     #[test]
     fn long_agent_output_does_not_expand_the_activity_panel() {
         let output = format!("{}\n{}", "а".repeat(1_000), "source code\n".repeat(10_000));
-        let preview = audit_preview(&output);
-        assert_eq!(preview.chars().count(), 180);
-        assert!(!preview.contains('\n'));
+        let detail = audit_detail(&output);
+        assert!(detail.len() <= 4099);
+        assert!(detail.ends_with('…'));
+    }
+
+    #[gpui::test]
+    fn agent_actions_expand_collapse_and_stay_scrollable(cx: &mut gpui::TestAppContext) {
+        use gpui::{AvailableSpace, Modifiers, size};
+
+        let (view, cx) = cx.add_window_view(|_, cx| Workspace::new_for_testing(cx));
+        cx.update(|_, app| {
+            view.update(app, |workspace, _| {
+                workspace.audit = (0..30)
+                    .map(|index| format!("read_file src/file-{index}.rs\nmock result"))
+                    .collect();
+            });
+        });
+        cx.simulate_resize(size(px(960.0), px(640.0)));
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(
+                point(px(0.0), px(0.0)),
+                size(
+                    AvailableSpace::Definite(px(960.0)),
+                    AvailableSpace::Definite(px(640.0)),
+                ),
+                |_, _| view.clone().into_any_element(),
+            );
+        };
+        let click_toggle = |cx: &mut gpui::VisualTestContext| {
+            let toggle = cx.debug_bounds("toggle-agent-actions").unwrap();
+            cx.simulate_click(
+                point(
+                    toggle.left() + toggle.size.width / 2.0,
+                    toggle.top() + toggle.size.height / 2.0,
+                ),
+                Modifiers::default(),
+            );
+        };
+
+        draw(cx);
+        assert!(cx.debug_bounds("agent-actions-scroll").is_none());
+        click_toggle(cx);
+        cx.update(|_, app| assert!(view.read(app).audit_expanded));
+
+        draw(cx);
+        let scroll = cx.debug_bounds("agent-actions-scroll").unwrap();
+        assert!(scroll.size.height <= px(160.0));
+        click_toggle(cx);
+        cx.update(|_, app| assert!(!view.read(app).audit_expanded));
     }
 
     #[test]

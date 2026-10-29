@@ -158,10 +158,6 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::English, "cancelling") => "Cancelling...",
         (Language::English, "cancelled") => "Cancelled",
         (Language::English, "sandbox_error") => "Cannot initialize project sandbox",
-        (Language::English, "agent_step_limit") => {
-            "Agent paused after 8 actions. Continue to resume."
-        }
-        (Language::English, "agent_continue") => "Continue agent",
         (Language::English, "command_palette") => "Select a command",
         (Language::English, "palette_filter") => "Type a command...",
         (Language::English, "no_commands") => "No matching commands",
@@ -307,10 +303,6 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::Russian, "cancelling") => "Останавливаю...",
         (Language::Russian, "cancelled") => "Остановлено",
         (Language::Russian, "sandbox_error") => "Не удалось настроить защищённую область проекта",
-        (Language::Russian, "agent_step_limit") => {
-            "Агент приостановлен после 8 действий. Нажмите «Продолжить»."
-        }
-        (Language::Russian, "agent_continue") => "Продолжить работу агента",
         (Language::Russian, "command_palette") => "Выберите команду",
         (Language::Russian, "palette_filter") => "Введите команду...",
         (Language::Russian, "no_commands") => "Нет подходящих команд",

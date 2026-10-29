@@ -2,7 +2,6 @@ use std::{collections::VecDeque, ops::Range};
 
 use aircode_ai::{ChatMessage, MessageRole, ToolCall};
 
-pub const MAX_AGENT_STEPS: usize = 8;
 const MAX_TOOL_RESULT_BYTES: usize = 32_000;
 const MAX_CONTEXT_MESSAGES: usize = 48;
 const MAX_CONTEXT_BYTES: usize = 500_000;
@@ -19,7 +18,7 @@ pub enum ResponseEnd {
 pub enum NextTool {
     Execute(ToolCall),
     FollowUp,
-    StepLimit,
+    Busy,
 }
 
 #[derive(Default)]
@@ -37,7 +36,6 @@ pub struct AgentTurn {
     response: Response,
     pending: VecDeque<ToolCall>,
     active: Option<ToolCall>,
-    steps: usize,
 }
 
 impl AgentTurn {
@@ -102,16 +100,11 @@ impl AgentTurn {
 
     pub fn next_tool(&mut self) -> NextTool {
         if self.active.is_some() {
-            return NextTool::StepLimit;
+            return NextTool::Busy;
         }
         let Some(call) = self.pending.pop_front() else {
             return NextTool::FollowUp;
         };
-        if self.steps >= MAX_AGENT_STEPS {
-            self.pending.push_front(call);
-            return NextTool::StepLimit;
-        }
-        self.steps += 1;
         self.active = Some(call.clone());
         NextTool::Execute(call)
     }
@@ -139,22 +132,8 @@ impl AgentTurn {
         self.active = None;
     }
 
-    /// Start another bounded batch without losing pending tool calls or their results.
-    pub fn resume(&mut self) -> bool {
-        if self.active.is_some() || self.pending.is_empty() {
-            return false;
-        }
-        self.steps = 0;
-        true
-    }
-
     pub fn request_messages(&self) -> Result<Vec<ChatMessage>, String> {
         bounded_context(&self.messages)
-    }
-
-    #[cfg(test)]
-    fn steps(&self) -> usize {
-        self.steps
     }
 }
 
@@ -291,6 +270,30 @@ mod tests {
     }
 
     #[test]
+    fn mock_streamed_final_text_is_recorded_once() {
+        let mut turn = AgentTurn::default();
+        turn.begin(vec![ChatMessage::user("Explain this code")]);
+        turn.begin_response();
+        turn.push_reasoning("Reasoning ");
+        turn.push_reasoning("complete");
+        turn.push_content("Final ");
+        turn.push_content("answer");
+
+        assert_eq!(turn.finish_response(), ResponseEnd::Final);
+        assert_eq!(turn.finish_response(), ResponseEnd::Ignored);
+
+        let messages = turn.request_messages().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[1].content, "Final answer");
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("Reasoning complete")
+        );
+        assert!(messages[1].tool_calls.is_empty());
+    }
+
+    #[test]
     fn mock_multiple_calls_run_one_at_a_time_in_order() {
         let mut turn = AgentTurn::default();
         turn.begin(vec![ChatMessage::user("Inspect two files")]);
@@ -341,10 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn step_limit_resets_for_each_user_turn() {
+    fn many_tool_calls_continue_without_a_step_limit() {
         let mut turn = AgentTurn::default();
         turn.begin(vec![ChatMessage::user("First turn")]);
-        for index in 0..MAX_AGENT_STEPS {
+        for index in 0..25 {
             tool_response(&mut turn, vec![call(&format!("call-{index}"))]);
             let NextTool::Execute(active) = turn.next_tool() else {
                 panic!("tool missing");
@@ -352,29 +355,7 @@ mod tests {
             turn.complete_tool(&active.id, "ok".into()).unwrap();
             assert_eq!(turn.next_tool(), NextTool::FollowUp);
         }
-        assert_eq!(turn.steps(), MAX_AGENT_STEPS);
-        tool_response(&mut turn, vec![call("over-limit")]);
-        assert_eq!(turn.next_tool(), NextTool::StepLimit);
-
-        assert!(turn.resume());
-        let NextTool::Execute(resumed) = turn.next_tool() else {
-            panic!("pending call lost")
-        };
-        assert_eq!(resumed.id, "over-limit");
-        turn.complete_tool(&resumed.id, "resumed".into()).unwrap();
-        assert_eq!(turn.next_tool(), NextTool::FollowUp);
-        assert_eq!(
-            turn.request_messages()
-                .unwrap()
-                .last()
-                .unwrap()
-                .tool_call_id
-                .as_deref(),
-            Some("over-limit")
-        );
-
         turn.begin(vec![ChatMessage::user("Independent second turn")]);
-        assert_eq!(turn.steps(), 0);
         tool_response(&mut turn, vec![call("new-turn")]);
         assert!(matches!(turn.next_tool(), NextTool::Execute(_)));
     }
