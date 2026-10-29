@@ -9,7 +9,7 @@
 
 ## English
 
-AIRcode combines a native GPUI editor, a project explorer, Tree-sitter syntax highlighting, and direct streaming AI integrations. Version **0.3.1** is a Windows x86_64 portable release.
+AIRcode combines a native GPUI editor, a project explorer, Tree-sitter syntax highlighting, and direct streaming AI integrations. Version **0.3.2** is a Windows x86_64 portable release.
 
 No Electron, embedded browser, CLI agent, or protocol-translating proxy is used. API keys stay in the operating system's credential store.
 
@@ -19,7 +19,7 @@ Download `aircode-windows-x86_64.zip` from the [latest GitHub Release](https://g
 
 The executable is portable and currently **unsigned**, so Windows SmartScreen may ask for confirmation. Verify the SHA256 file published beside the package.
 
-### Features in v0.3.1
+### Features in v0.3.2
 
 - Open a complete project folder with a lazy file tree and filesystem change watching.
 - Open, edit, and save UTF-8 files, with Unicode selection, Windows IME input, clipboard, undo/redo, and unsaved-change confirmation.
@@ -161,7 +161,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 ## Русский
 
-AIRcode объединяет нативный GPUI-редактор, дерево проекта, подсветку Tree-sitter и прямые потоковые ИИ-интеграции. Версия **0.3.1** — portable-релиз для Windows x86_64.
+AIRcode объединяет нативный GPUI-редактор, дерево проекта, подсветку Tree-sitter и прямые потоковые ИИ-интеграции. Версия **0.3.2** — portable-релиз для Windows x86_64.
 
 Без Electron, встроенного браузера, CLI-агентов и прокси для преобразования протоколов. API-ключи хранятся в системном хранилище ОС.
 
@@ -171,7 +171,7 @@ AIRcode объединяет нативный GPUI-редактор, дерев�
 
 Приложение portable и пока **не имеет цифровой подписи**, поэтому Windows SmartScreen может запросить подтверждение. Проверьте SHA256-файл рядом с пакетом.
 
-### Возможности v0.3.1
+### Возможности v0.3.2
 
 - Открытие всей папки проекта, ленивое дерево файлов и отслеживание изменений на диске.
 - Открытие, редактирование и сохранение UTF-8 файлов, Unicode-выделение, Windows IME, буфер обмена, undo/redo и подтверждение при потере изменений.

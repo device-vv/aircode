@@ -232,7 +232,10 @@ fn powershell_ctrl_c_interrupts_a_running_command() {
     };
     let terminal = TestTerminal::spawn(&shell, TerminalSize::new(24, 100).unwrap());
     terminal.send_line("Write-Output ('SLEEP_' + 'BEGIN'); Start-Sleep -Seconds 30");
-    wait_for_text(&terminal, "SLEEP_BEGIN");
+    let before_interrupt = wait_for(&terminal, "SLEEP_BEGIN", |snapshot| {
+        visible_text(snapshot).contains("SLEEP_BEGIN")
+    });
+    let prompts_before = occurrence_count(&visible_text(&before_interrupt), "PS ");
 
     let ctrl = Modifiers {
         shift: false,
@@ -243,7 +246,9 @@ fn powershell_ctrl_c_interrupts_a_running_command() {
         .terminal()
         .send_key(KeyEvent::with_modifiers(Key::Char('c'), ctrl))
         .unwrap();
-    thread::sleep(Duration::from_millis(100));
+    wait_for(&terminal, "prompt after Ctrl+C", |snapshot| {
+        occurrence_count(&visible_text(snapshot), "PS ") > prompts_before
+    });
     terminal.send_line("Write-Output ('INTERRUPT_' + 'OK')");
     wait_for_text(&terminal, "INTERRUPT_OK");
 
