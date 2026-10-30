@@ -84,15 +84,23 @@ impl AgentAction {
 
 pub struct AgentExecutor {
     root: PathBuf,
+    root_alias: PathBuf,
 }
 
 impl AgentExecutor {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, String> {
+        let root_alias = if root.as_ref().is_absolute() {
+            root.as_ref().to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(root.as_ref())
+        };
         let root = root
             .as_ref()
             .canonicalize()
             .map_err(|error| error.to_string())?;
-        Ok(Self { root })
+        Ok(Self { root, root_alias })
     }
 
     pub fn root(&self) -> &Path {
@@ -208,6 +216,10 @@ impl AgentExecutor {
             requested.to_path_buf()
         } else {
             self.root.join(requested)
+        };
+        let candidate = match candidate.strip_prefix(&self.root_alias) {
+            Ok(relative) => self.root.join(relative),
+            Err(_) => candidate,
         };
         #[cfg(windows)]
         let candidate = {
@@ -825,6 +837,39 @@ mod tests {
                 .unwrap()
                 .contains(std::env::consts::OS)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_explicitly_opened_root_alias_preserves_relative_protection() {
+        let root = project("root-alias");
+        let alias = root.with_extension("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let executor = AgentExecutor::new(&alias).unwrap();
+        executor
+            .execute(&AgentAction {
+                name: "write_file".into(),
+                arguments: json!({"path": alias.join("new/deep/file.rs"), "content": "safe"})
+                    .to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("new/deep/file.rs")).unwrap(),
+            "safe"
+        );
+        assert!(
+            executor
+                .execute(&AgentAction {
+                    name: "write_file".into(),
+                    arguments: json!({"path": alias.join(".env"), "content": "blocked"})
+                        .to_string(),
+                })
+                .await
+                .is_err()
+        );
+        fs::remove_file(alias).unwrap();
+        cleanup_path(&root);
     }
 
     #[tokio::test]
