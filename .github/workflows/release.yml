@@ -23,7 +23,6 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: aircode-linux-x86_64
-            cache: linux-x86_64-ubuntu22
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: aircode-macos-arm64
@@ -36,8 +35,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: ${{ runner.os == 'Linux' && 'v033-rust-ubuntu22' || 'v0-rust' }}
           shared-key: check
-          key: ${{ matrix.cache }}
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
