@@ -13,3 +13,4 @@
 *.key
 credentials.json
 .codex-remote-attachments/
+/aircode-chat.md

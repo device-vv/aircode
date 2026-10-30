@@ -1,5 +1,7 @@
 mod agent_turn;
 mod document;
+mod markdown;
+mod team;
 mod terminal_view;
 mod text_input;
 mod theme;

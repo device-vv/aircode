@@ -14,4 +14,4 @@ pub use provider::{
     AssistantToolCall, AssistantToolFunction, ChatMessage, MessageRole, ProviderConfig,
     ProviderKind, ReasoningEffort, Region, ToolCall, ToolCallKind,
 };
-pub use settings::{AppSettings, SettingsStore};
+pub use settings::{AgentProfile, AppSettings, MAX_AGENT_PROFILES, SettingsStore, normalize_alias};

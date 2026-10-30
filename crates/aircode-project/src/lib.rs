@@ -134,6 +134,29 @@ impl Project {
         }
     }
 
+    /// Reveal a project path without selecting it or moving UI focus.
+    pub fn reveal(&mut self, path: &Path) {
+        let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !target.starts_with(&self.root) {
+            return;
+        }
+        let mut current = if target.is_dir() {
+            Some(target.as_path())
+        } else {
+            target.parent()
+        };
+        while let Some(directory) = current {
+            if !directory.starts_with(&self.root) {
+                break;
+            }
+            self.expanded.insert(directory.to_path_buf());
+            if directory == self.root {
+                break;
+            }
+            current = directory.parent();
+        }
+    }
+
     pub fn visible_rows(&mut self) -> Vec<ProjectRow> {
         let mut rows = Vec::new();
         let root = self.root.clone();
@@ -342,6 +365,33 @@ mod tests {
                 .visible_rows()
                 .iter()
                 .any(|row| row.entry.name == "lib.rs")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reveal_expands_ancestors_without_selecting_or_leaving_the_project() {
+        let root =
+            std::env::temp_dir().join(format!("aircode-project-reveal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        fs::write(root.join("src/nested/lib.rs"), "pub fn value() {}\n").unwrap();
+        let mut project = Project::open(&root).unwrap();
+        project.reveal(&root.join("src/nested/lib.rs"));
+        let rows = project.visible_rows();
+        assert!(rows.iter().any(|row| row.entry.name == "lib.rs"));
+        assert!(
+            rows.iter()
+                .any(|row| row.entry.name == "nested" && row.expanded)
+        );
+
+        let outside = root.parent().unwrap().join("outside");
+        project.reveal(&outside);
+        assert!(
+            !project
+                .visible_rows()
+                .iter()
+                .any(|row| row.entry.path == outside)
         );
         fs::remove_dir_all(root).unwrap();
     }

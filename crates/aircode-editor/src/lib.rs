@@ -106,6 +106,29 @@ impl Document {
         Ok(())
     }
 
+    /// Reload an unmodified document from disk. Dirty buffers are never
+    /// replaced; callers must resolve that conflict explicitly.
+    pub fn reload_clean(&mut self) -> Result<bool, DocumentError> {
+        if self.is_modified() {
+            return Ok(false);
+        }
+        let Some(path) = self.path.clone() else {
+            return Ok(false);
+        };
+        let replacement = Self::open(path)?;
+        self.text = replacement.text;
+        self.saved_text = self.text.clone();
+        let mut end = self.selection.end.min(self.text.len());
+        while !self.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.selection = end..end;
+        self.undo.clear();
+        self.redo.clear();
+        self.reindex();
+        Ok(true)
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }

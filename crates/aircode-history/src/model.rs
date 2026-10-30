@@ -90,6 +90,9 @@ pub struct ChatMessage {
     reasoning: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Visible author label, such as an attached agent alias.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    speaker: String,
 }
 
 impl ChatMessage {
@@ -104,7 +107,13 @@ impl ChatMessage {
             state: String::new(),
             reasoning: String::new(),
             error: None,
+            speaker: String::new(),
         }
+    }
+
+    pub fn with_speaker(mut self, speaker: impl Into<String>) -> Self {
+        self.speaker = speaker.into();
+        self
     }
 
     pub fn with_created_at_unix_ms(mut self, timestamp: u64) -> Self {
@@ -132,6 +141,10 @@ impl ChatMessage {
     }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    pub fn speaker(&self) -> &str {
+        &self.speaker
     }
 
     pub fn id(&self) -> &str {
@@ -379,6 +392,7 @@ impl HistoryRecord {
                 limits.max_message_bytes,
             )?;
             check_limit("message state", message.state.len(), 64)?;
+            check_limit("message speaker", message.speaker.len(), 128)?;
             check_limit(
                 "message reasoning",
                 message.reasoning.len(),
@@ -392,7 +406,8 @@ impl HistoryRecord {
             visible_content_bytes = visible_content_bytes
                 .saturating_add(message.content.len())
                 .saturating_add(message.reasoning.len())
-                .saturating_add(message.error.as_ref().map_or(0, String::len));
+                .saturating_add(message.error.as_ref().map_or(0, String::len))
+                .saturating_add(message.speaker.len());
             if !visible_ids.insert(message.id.as_str()) {
                 return Err(HistoryError::InvalidRecord(format!(
                     "duplicate visible message ID: {}",

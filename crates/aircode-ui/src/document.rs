@@ -379,6 +379,23 @@ impl DocumentView {
         }
     }
 
+    pub(crate) fn reload_clean(&mut self, cx: &mut Context<Self>) -> Result<bool, String> {
+        let reloaded = self
+            .document
+            .reload_clean()
+            .map_err(|error| error.to_string())?;
+        if reloaded {
+            self.revision = self.revision.wrapping_add(1);
+            self.cancel_completion();
+            self.max_line_columns = max_line_columns(&self.document);
+            self.last_layouts.clear();
+            self.last_bounds = None;
+            self.refresh_syntax();
+            cx.notify();
+        }
+        Ok(reloaded)
+    }
+
     pub fn set_document(&mut self, mut document: Document, cx: &mut Context<Self>) {
         self.revision = self.revision.wrapping_add(1);
         self.cancel_completion();

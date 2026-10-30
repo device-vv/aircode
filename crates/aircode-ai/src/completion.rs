@@ -166,6 +166,7 @@ fn append_completion(result: &mut String, event: StreamEvent) -> Result<(), AiEr
             }
             result.push_str(&text);
         }
+        StreamEvent::WriteFileProgress { .. } => {}
         StreamEvent::Error(message) => return Err(AiError::Protocol(message)),
         _ => {}
     }
@@ -190,6 +191,16 @@ mod tests {
         append_completion(
             &mut result,
             StreamEvent::ReasoningDelta("secret thought".into()),
+        )
+        .unwrap();
+        append_completion(
+            &mut result,
+            StreamEvent::WriteFileProgress {
+                call_id: "call-1".into(),
+                path: "src/main.rs".into(),
+                content: "ignored".into(),
+                content_truncated: false,
+            },
         )
         .unwrap();
         append_completion(&mut result, StreamEvent::ContentDelta("actual code".into())).unwrap();

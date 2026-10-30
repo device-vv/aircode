@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "aircode-agent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde_json",
  "similar",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "aircode-ai"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "directories",
  "futures-util",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "aircode-app"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aircode-ui",
  "embed-resource",
@@ -98,11 +98,11 @@ dependencies = [
 
 [[package]]
 name = "aircode-core"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "aircode-editor"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "unicode-segmentation",
@@ -119,21 +119,21 @@ dependencies = [
 
 [[package]]
 name = "aircode-i18n"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "sys-locale",
 ]
 
 [[package]]
 name = "aircode-project"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "notify",
 ]
 
 [[package]]
 name = "aircode-syntax"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "tree-sitter",
  "tree-sitter-c",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "aircode-ui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aircode-agent",
  "aircode-ai",
@@ -177,6 +177,7 @@ dependencies = [
  "aircode-terminal",
  "gpui",
  "raw-window-handle",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

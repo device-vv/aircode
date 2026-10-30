@@ -155,8 +155,54 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         }
         (Language::English, "audit") => "Agent activity",
         (Language::English, "approval_required") => "Approval required",
+        (Language::English, "ai_badge") => "AI",
+        (Language::English, "agent_proposed") => "AI proposed change — not written",
+        (Language::English, "agent_generating") => "AI is generating code — not written",
+        (Language::English, "agent_running") => "AI is working",
+        (Language::English, "agent_finished") => "AI finished",
+        (Language::English, "agent_conflict") => "AI wrote on disk; unsaved editor kept",
+        (Language::English, "agent_failed") => "AI action failed",
+        (Language::English, "agent_command") => "AI command",
+        (Language::English, "agent_output") => "AI output",
+        (Language::English, "agent_denied") => "The user denied this action.",
+        (Language::English, "agent_retrying") => "Transient connection issue; retrying",
+        (Language::English, "proposed_content") => "Proposed content (not written)",
+        (Language::English, "streaming_preview") => "Streamed proposal in progress (not written)",
+        (Language::English, "agent_preview_truncated") => {
+            "Preview is bounded and truncated; the complete call is still subject to approval."
+        }
+        (Language::English, "agent_write_refreshed") => {
+            "AI updated on disk; clean editors refreshed:"
+        }
+        (Language::English, "agent_write_conflict") => {
+            "AI updated this file on disk, but your unsaved buffer was preserved:"
+        }
+        (Language::English, "agent_write_refresh_failed") => {
+            "AI wrote the file, but an open editor could not be refreshed"
+        }
+        (Language::English, "agent_wrote") => "AI wrote:",
         (Language::English, "cancelling") => "Cancelling...",
         (Language::English, "cancelled") => "Cancelled",
+        (Language::English, "export_chat") => "Export chat...",
+        (Language::English, "export_saved") => "Chat exported",
+        (Language::English, "export_failed") => "Could not export chat",
+        (Language::English, "partial_response") => "Partial snapshot",
+        (Language::English, "shared_task") => "Shared task",
+        (Language::English, "team_queue") => "Sequential team queue",
+        (Language::English, "team_planning") => "Leader is preparing a bounded plan...",
+        (Language::English, "skip_task") => "Skip",
+        (Language::English, "queue_pending") => "pending",
+        (Language::English, "queue_running") => "running",
+        (Language::English, "queue_succeeded") => "succeeded",
+        (Language::English, "queue_failed") => "failed",
+        (Language::English, "queue_cancelled") => "cancelled",
+        (Language::English, "agent_profiles") => "Agent profiles (@alias)",
+        (Language::English, "save_profile") => "Save current as profile",
+        (Language::English, "profile_saved") => "Agent profile saved",
+        (Language::English, "select_profile") => "Edit",
+        (Language::English, "attach_profile") => "Attach",
+        (Language::English, "detach_profile") => "Detach",
+        (Language::English, "remove_profile") => "Remove",
         (Language::English, "sandbox_error") => "Cannot initialize project sandbox",
         (Language::English, "command_palette") => "Select a command",
         (Language::English, "palette_filter") => "Type a command...",
@@ -300,8 +346,58 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         }
         (Language::Russian, "audit") => "Действия агента",
         (Language::Russian, "approval_required") => "Требуется разрешение",
+        (Language::Russian, "ai_badge") => "ИИ",
+        (Language::Russian, "agent_proposed") => "ИИ предлагает изменение — ещё не записано",
+        (Language::Russian, "agent_generating") => "ИИ создаёт код — ещё не записано",
+        (Language::Russian, "agent_running") => "ИИ работает",
+        (Language::Russian, "agent_finished") => "ИИ завершил действие",
+        (Language::Russian, "agent_conflict") => {
+            "ИИ записал файл на диск; несохранённый буфер сохранён"
+        }
+        (Language::Russian, "agent_failed") => "Действие ИИ завершилось ошибкой",
+        (Language::Russian, "agent_command") => "Команда ИИ",
+        (Language::Russian, "agent_output") => "Вывод ИИ",
+        (Language::Russian, "agent_denied") => "Пользователь запретил это действие.",
+        (Language::Russian, "agent_retrying") => "Временная ошибка соединения; повторная попытка",
+        (Language::Russian, "proposed_content") => "Предлагаемое содержимое (не записано)",
+        (Language::Russian, "streaming_preview") => {
+            "Потоковый предпросмотр создаётся (не записано)"
+        }
+        (Language::Russian, "agent_preview_truncated") => {
+            "Предпросмотр ограничен и обрезан; полный вызов всё равно требует разрешения."
+        }
+        (Language::Russian, "agent_write_refreshed") => {
+            "ИИ обновил файл на диске; чистые редакторы перезагружены:"
+        }
+        (Language::Russian, "agent_write_conflict") => {
+            "ИИ обновил файл на диске, но ваш несохранённый буфер сохранён:"
+        }
+        (Language::Russian, "agent_write_refresh_failed") => {
+            "ИИ записал файл, но не удалось обновить открытый редактор"
+        }
+        (Language::Russian, "agent_wrote") => "ИИ записал:",
         (Language::Russian, "cancelling") => "Останавливаю...",
         (Language::Russian, "cancelled") => "Остановлено",
+        (Language::Russian, "export_chat") => "Экспорт чата…",
+        (Language::Russian, "export_saved") => "Чат экспортирован",
+        (Language::Russian, "export_failed") => "Не удалось экспортировать чат",
+        (Language::Russian, "partial_response") => "Неполный снимок",
+        (Language::Russian, "shared_task") => "Общая задача",
+        (Language::Russian, "team_queue") => "Последовательная очередь агентов",
+        (Language::Russian, "team_planning") => "Лидер готовит ограниченный план...",
+        (Language::Russian, "skip_task") => "Пропустить",
+        (Language::Russian, "queue_pending") => "в очереди",
+        (Language::Russian, "queue_running") => "выполняется",
+        (Language::Russian, "queue_succeeded") => "успешно",
+        (Language::Russian, "queue_failed") => "ошибка",
+        (Language::Russian, "queue_cancelled") => "отменено",
+        (Language::Russian, "agent_profiles") => "Профили агентов (@псевдоним)",
+        (Language::Russian, "save_profile") => "Сохранить текущий профиль",
+        (Language::Russian, "profile_saved") => "Профиль агента сохранён",
+        (Language::Russian, "select_profile") => "Изменить",
+        (Language::Russian, "attach_profile") => "Подключить",
+        (Language::Russian, "detach_profile") => "Отключить",
+        (Language::Russian, "remove_profile") => "Удалить",
         (Language::Russian, "sandbox_error") => "Не удалось настроить защищённую область проекта",
         (Language::Russian, "command_palette") => "Выберите команду",
         (Language::Russian, "palette_filter") => "Введите команду...",
@@ -386,6 +482,28 @@ mod tests {
             "terminal_start_failed",
         ];
         for key in keys {
+            assert_ne!(tr(Language::English, key), key);
+            assert_ne!(tr(Language::Russian, key), key);
+            assert_ne!(tr(Language::English, key), tr(Language::Russian, key));
+        }
+    }
+
+    #[test]
+    fn agent_progress_labels_are_localized() {
+        for key in [
+            "ai_badge",
+            "agent_proposed",
+            "agent_generating",
+            "agent_running",
+            "agent_finished",
+            "agent_conflict",
+            "agent_command",
+            "agent_output",
+            "proposed_content",
+            "streaming_preview",
+            "agent_write_refreshed",
+            "agent_write_conflict",
+        ] {
             assert_ne!(tr(Language::English, key), key);
             assert_ne!(tr(Language::Russian, key), key);
             assert_ne!(tr(Language::English, key), tr(Language::Russian, key));
