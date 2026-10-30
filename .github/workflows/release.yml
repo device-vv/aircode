@@ -114,8 +114,24 @@ jobs:
           test -f "dist/aircode-windows-x86_64.zip.sha256"
           test -f "dist/aircode-linux-x86_64.tar.gz.sha256"
           test -f "dist/aircode-macos-arm64.tar.gz.sha256"
+          (cd dist && sha256sum -c -- *.sha256)
       - uses: softprops/action-gh-release@v2
+        id: upload
         with:
           name: AIRcode ${{ github.ref_name }}
+          draft: true
           body_path: docs/release-notes/${{ github.ref_name }}.md
           files: dist/*
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.upload.outputs.id }}
+        run: |
+          curl --fail-with-body --retry 3 --request PATCH \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Content-Type: application/json" \
+            "$API_URL/repos/$REPOSITORY/releases/$RELEASE_ID" \
+            --data '{"draft":false,"make_latest":"true"}' --output /dev/null

@@ -4369,7 +4369,7 @@ impl Workspace {
                     .flex_1()
                     .min_h(px(0.0))
                     .gap_4()
-                    .p_4()
+                    .p_2()
                     .overflow_y_scroll()
                     .when(self.chat.is_empty(), |this| {
                         this.child(empty_chat(theme, self.language))
@@ -4390,44 +4390,56 @@ impl Workspace {
                                     .into_any_element()
                             })
                             .collect::<Vec<_>>()
+                    })
+                    .when_some(self.team_queue.clone(), |this, queue| {
+                        this.child(self.team_queue_panel(queue, theme, cx))
+                    })
+                    .when(!self.audit.is_empty(), |this| {
+                        this.child(self.audit_panel(theme, cx))
                     }),
             )
-            .when_some(self.team_queue.clone(), |this, queue| {
-                this.child(self.team_queue_panel(queue, theme, cx))
-            })
-            .when(!self.audit.is_empty(), |this| {
-                this.child(self.audit_panel(theme, cx))
-            })
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .m_3()
-                    .p_3()
+                    .flex_none()
+                    .gap_1()
+                    .m_2()
+                    .p_2()
                     .rounded_lg()
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.window)
-                    .children(attached_profiles.into_iter().map(|profile| {
-                        div()
-                            .id(gpui::SharedString::from(format!(
-                                "mention-{}",
-                                profile.alias
-                            )))
-                            .flex_none()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .text_color(theme.accent)
-                            .bg(theme.accent_soft)
-                            .cursor_pointer()
-                            .child(format!("@{}", profile.alias))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.insert_mention(profile.alias.clone(), cx);
-                            }))
-                    }))
+                    .when(!attached_profiles.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .id("attached-agent-mentions")
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .max_h(px(56.0))
+                                .overflow_y_scroll()
+                                .children(attached_profiles.into_iter().map(|profile| {
+                                    div()
+                                        .id(gpui::SharedString::from(format!(
+                                            "mention-{}",
+                                            profile.alias
+                                        )))
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .text_color(theme.accent)
+                                        .bg(theme.accent_soft)
+                                        .cursor_pointer()
+                                        .child(format!("@{}", profile.alias))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.insert_mention(profile.alias.clone(), cx);
+                                        }))
+                                })),
+                        )
+                    })
                     .child(self.chat_input.clone())
                     .child(
                         div()
@@ -6600,6 +6612,80 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "shared goal");
         assert_eq!(messages[1].content, "own result");
+    }
+
+    #[gpui::test]
+    fn team_stop_control_fits_above_terminal_at_minimum_window(cx: &mut gpui::TestAppContext) {
+        use gpui::{AvailableSpace, size};
+        let root = std::env::temp_dir().join(format!(
+            "aircode-team-layout-{}-{}",
+            std::process::id(),
+            NEXT_CHAT_ENTRY_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| Workspace::new_for_testing(cx));
+        cx.update(|_, app| {
+            view.update(app, |workspace, _| {
+                workspace.project = Some(Project::open(&root).unwrap());
+                let profiles = (0..MAX_AGENT_PROFILES)
+                    .map(|index| {
+                        AgentProfile::new(
+                            format!("agent{index}{}", "x".repeat(26)),
+                            ProviderConfig::default(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                workspace.settings.agent_profiles = profiles.clone();
+                let canonical = workspace.project.as_ref().unwrap().root().to_path_buf();
+                workspace.settings.project_agents.insert(
+                    canonical.to_string_lossy().into_owned(),
+                    profiles
+                        .iter()
+                        .map(|profile| profile.alias.clone())
+                        .collect(),
+                );
+                let mut queue = TeamQueue::explicit(
+                    "goal".into(),
+                    &canonical,
+                    vec![
+                        Assignment {
+                            agent: profiles[0].alias.clone(),
+                            task: "implement".into(),
+                        },
+                        Assignment {
+                            agent: profiles[1].alias.clone(),
+                            task: "review".into(),
+                        },
+                    ],
+                    profiles,
+                );
+                queue.begin_next().unwrap();
+                workspace.team_queue = Some(queue);
+                workspace.streaming = true;
+                workspace.terminal_visible = true;
+                workspace.terminal_height = 240.0;
+            })
+        });
+        cx.simulate_resize(size(px(960.0), px(640.0)));
+        for language in [Language::English, Language::Russian] {
+            cx.update(|_, app| view.update(app, |workspace, _| workspace.language = language));
+            cx.draw(
+                point(px(0.0), px(0.0)),
+                size(
+                    AvailableSpace::Definite(px(960.0)),
+                    AvailableSpace::Definite(px(640.0)),
+                ),
+                |_, _| view.clone().into_any_element(),
+            );
+            let stop = cx.debug_bounds("send-button").unwrap();
+            let terminal = cx.debug_bounds("qa-terminal_panel").unwrap();
+            assert!(
+                stop.top() >= px(0.0) && stop.bottom() <= terminal.top(),
+                "{language:?}: Stop {stop:?}, terminal {terminal:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[gpui::test]
