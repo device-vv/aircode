@@ -1,0 +1,23 @@
+[package]
+name = "aircode-collab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Голосовые звонки (WebRTC): тянет тяжёлый стек webrtc-rs.
+voice = ["dep:webrtc", "dep:hound", "dep:cpal"]
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-tungstenite = { version = "0.26", features = ["connect"] }
+futures-util = "0.3.31"
+yrs = "0.21"
+serde = { workspace = true }
+serde_json = { workspace = true }
+webrtc = { version = "0.13", optional = true }
+hound = { version = "3.5", optional = true }
+cpal = { version = "0.15", optional = true }
+anyhow = "1"

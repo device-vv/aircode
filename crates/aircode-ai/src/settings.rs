@@ -58,6 +58,10 @@ pub struct AppSettings {
     pub agent_profiles: Vec<AgentProfile>,
     /// Canonical project root string -> attached profile aliases.
     pub project_agents: BTreeMap<String, Vec<String>>,
+    /// Collab: имя участника, сервер последнего подключения, комната.
+    pub collab_name: String,
+    pub collab_server: String,
+    pub collab_room: String,
 }
 
 impl Default for AppSettings {
@@ -73,6 +77,9 @@ impl Default for AppSettings {
             permission_mode: "ask_important".into(),
             agent_profiles: Vec::new(),
             project_agents: BTreeMap::new(),
+            collab_name: String::new(),
+            collab_server: String::new(),
+            collab_room: "main".into(),
         }
     }
 }

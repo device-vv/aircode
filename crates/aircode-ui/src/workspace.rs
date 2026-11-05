@@ -14,6 +14,8 @@ use aircode_ai::{
     MessageRole, ProviderConfig, ProviderKind, ReasoningEffort, Region, SettingsStore, StreamEvent,
     ToolCall, summarize_conversation,
 };
+use aircode_collab::{CollabBinding, CollabCommand, CollabConfig, CollabEvent, CollabHandle};
+use aircode_collab_relay::RelayHandle;
 use aircode_core::{NavigationPanel, WorkspaceState};
 use aircode_editor::Document;
 use aircode_i18n::{Language, system_is_russian, tr};
@@ -115,6 +117,60 @@ struct AgentActivity {
     preview_truncated: bool,
     command: Option<String>,
     output: Option<String>,
+}
+
+/// Живая collab-сессия, привязанная к активному документу.
+struct CollabUi {
+    handle: CollabHandle,
+    document: Entity<DocumentView>,
+    /// Последний текст, согласованный с сессией (для детекта локальных правок).
+    binding: CollabBinding,
+    last_revision: u64,
+    /// В host-режиме держим встроенный релей живым до конца сессии.
+    relay: Option<RelayHandle>,
+    _pump: gpui::Task<()>,
+}
+
+/// Участник сессии для панели (имя + цвет из awareness).
+#[derive(Clone, Debug)]
+struct CollabPeerView {
+    name: String,
+    color: u32,
+}
+
+/// Состояние голосового канала для панели.
+#[derive(Clone, Debug, Default)]
+struct VoiceUi {
+    /// Мы в голосовом канале (сигналинг поднят).
+    joined: bool,
+    /// Микрофон выключен.
+    muted: bool,
+    /// WebRTC установлен — звук реально идёт.
+    connected: bool,
+    /// Собеседник в голосовом канале.
+    peer_present: bool,
+}
+
+/// Разобрать awareness-state участника (`{"user":{"name","color"}}`).
+fn parse_peer(state_json: Option<&str>) -> Option<CollabPeerView> {
+    let value: serde_json::Value = serde_json::from_str(state_json?).ok()?;
+    let user = value.get("user")?;
+    let name = user.get("name")?.as_str()?.to_string();
+    let color = user
+        .get("color")
+        .and_then(|c| c.as_str())
+        .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
+        .map(|v| if v <= 0xFF_FFFF { (v << 8) | 0xFF } else { v })
+        .unwrap_or(0x888888FF);
+    Some(CollabPeerView { name, color })
+}
+
+/// Локальный IP в LAN (UDP-«подключение» ничего не отправляет, только
+/// заставляет ОС выбрать исходящий интерфейс).
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:80").ok()?;
+    Some(socket.local_addr().ok()?.ip())
 }
 
 fn bounded_agent_preview(content: &str, max_bytes: usize) -> (String, bool) {
@@ -341,6 +397,8 @@ actions!(
         SendMessage,
         StopGeneration,
         ToggleAi,
+        ToggleCollab,
+        ToggleVoice,
         ToggleFocus,
         TogglePalette,
         ToggleSettings,
@@ -364,6 +422,8 @@ pub fn register_actions(cx: &mut App) {
         KeyBinding::new("ctrl-shift-s", SaveFileAs, None),
         KeyBinding::new("secondary-p", TogglePalette, None),
         KeyBinding::new("secondary-shift-i", ToggleAi, None),
+        KeyBinding::new("secondary-shift-l", ToggleCollab, None),
+        KeyBinding::new("secondary-shift-v", ToggleVoice, None),
         KeyBinding::new("secondary-shift-f", ToggleFocus, None),
         KeyBinding::new("secondary-shift-t", ToggleTheme, None),
         KeyBinding::new("secondary-shift-j", ToggleTerminal, None),
@@ -429,6 +489,14 @@ pub fn register_global_actions(workspace: Entity<Workspace>, cx: &mut App) {
             this.state.toggle_ai();
             cx.notify();
         });
+    });
+    let view = workspace.clone();
+    cx.on_action(move |_: &ToggleCollab, cx| {
+        view.update(cx, |this, cx| this.toggle_collab(cx));
+    });
+    let view = workspace.clone();
+    cx.on_action(move |_: &ToggleVoice, cx| {
+        view.update(cx, |this, cx| this.toggle_voice(cx));
     });
     let view = workspace.clone();
     cx.on_action(move |_: &ToggleFocus, cx| {
@@ -645,6 +713,7 @@ enum FocusTarget {
     Palette,
     Settings,
     Menu,
+    Collab,
 }
 
 const PALETTE_COMMANDS: [(&str, &str, PaletteCommand); 8] = [
@@ -791,6 +860,14 @@ pub struct Workspace {
     scrollbar_drag: Option<ScrollbarDrag>,
     window_width: f32,
     document: Entity<DocumentView>,
+    collab: Option<CollabUi>,
+    collab_peers: Vec<CollabPeerView>,
+    voice: VoiceUi,
+    collab_dialog_open: bool,
+    collab_dialog_host: bool,
+    collab_address_input: Entity<TextInput>,
+    collab_room_input: Entity<TextInput>,
+    collab_name_input: Entity<TextInput>,
     terminal: Entity<TerminalView>,
     terminal_visible: bool,
     terminal_height: f32,
@@ -924,6 +1001,33 @@ impl Workspace {
         model_input.update(cx, |input, _| input.set_language(language));
         let palette_input = cx.new(|cx| TextInput::new(tr(language, "palette_filter"), cx));
         let terminal = cx.new(|cx| TerminalView::new(language, cx));
+        // Поля диалога совместной сессии: предзаполняемся из настроек/env.
+        let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        let collab_address_input = cx.new(|cx| TextInput::new("ws://192.168.1.5:9415", cx));
+        let collab_room_input = cx.new(|cx| TextInput::new(tr(language, "collab_room"), cx));
+        let collab_name_input = cx.new(|cx| TextInput::new(tr(language, "collab_name"), cx));
+        let initial_address = env("AIRCODE_COLLAB_SERVER")
+            .unwrap_or_else(|| settings.collab_server.clone());
+        let initial_room =
+            env("AIRCODE_COLLAB_ROOM").unwrap_or_else(|| settings.collab_room.clone());
+        let initial_name = {
+            let saved = settings.collab_name.clone();
+            if saved.is_empty() { None } else { Some(saved) }
+        };
+        collab_address_input.update(cx, |input, cx| {
+            input.set_text(initial_address, cx);
+        });
+        collab_room_input.update(cx, |input, cx| {
+            input.set_text(if initial_room.is_empty() { "main".into() } else { initial_room }, cx);
+        });
+        if let Some(name) = initial_name {
+            collab_name_input.update(cx, |input, cx| {
+                input.set_text(name, cx);
+            });
+        }
+        collab_address_input.update(cx, |input, _| input.set_language(language));
+        collab_room_input.update(cx, |input, _| input.set_language(language));
+        collab_name_input.update(cx, |input, _| input.set_language(language));
         palette_input.update(cx, |input, _| input.set_language(language));
         base_url_input.update(cx, |input, cx| {
             input.set_text(settings.provider.base_url.clone(), cx);
@@ -960,6 +1064,15 @@ impl Workspace {
             tabs: vec![document.clone()],
             tab_scroll: ScrollHandle::new(),
             document,
+            collab: None,
+            collab_peers: Vec::new(),
+            voice: VoiceUi::default(),
+            collab_dialog_open: false,
+            collab_dialog_host: std::env::var("AIRCODE_COLLAB_HOST")
+                .is_ok_and(|v| v == "1" || v == "true"),
+            collab_address_input,
+            collab_room_input,
+            collab_name_input,
             terminal,
             terminal_visible: false,
             terminal_height: 240.0,
@@ -1017,6 +1130,7 @@ impl Workspace {
         self.settings_open
             || self.menu_open
             || self.state.palette_open
+            || self.collab_dialog_open
             || self.pending_tool.is_some()
             || self.pending_discard.is_some()
             || self.close_confirmation_open
@@ -1034,6 +1148,266 @@ impl Workspace {
         self.palette_selected = 0;
         self.palette_input.update(cx, |input, cx| input.clear(cx));
         self.pending_focus = Some(FocusTarget::Palette);
+        cx.notify();
+    }
+
+    /// Запустить/остановить совместную сессию для активного документа.
+    /// Если сессии нет — открывает диалог (создать комнату / присоединиться);
+    /// параметры из диалога сохраняются в настройки. Env-переменные
+    /// (`AIRCODE_COLLAB_*`) по-прежнему работают как предзаполнение.
+    fn toggle_collab(&mut self, cx: &mut Context<Self>) {
+        if self.collab.take().is_some() {
+            // Drop CollabHandle сам отправит Close в актор.
+            self.collab_peers.clear();
+            self.voice = VoiceUi::default();
+            self.status = self.tr("collab_stopped").to_string();
+            cx.notify();
+            return;
+        }
+        self.close_overlays(cx);
+        self.collab_dialog_open = true;
+        self.pending_focus = Some(FocusTarget::Collab);
+        cx.notify();
+    }
+
+    /// Поднять collab-сессию с готовой конфигурацией (из диалога или env).
+    fn start_collab(
+        &mut self,
+        config: CollabConfig,
+        relay: Option<RelayHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(relay) = &relay {
+            let ip = lan_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            self.status = format!(
+                "{}: ws://{}:{}/ + {}",
+                self.tr("collab_host_listening"),
+                ip,
+                relay.addr().port(),
+                config.room
+            );
+        }
+        let document = self.document.clone();
+        let (binding, last_revision) = {
+            let view = document.read(cx);
+            (
+                CollabBinding::new(view.document().text().to_string()),
+                view.revision(),
+            )
+        };
+        let handle = CollabHandle::spawn(config);
+        let pump = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                if this.update(cx, |this, cx| this.collab_tick(cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.collab = Some(CollabUi {
+            handle,
+            document,
+            binding,
+            last_revision,
+            relay,
+            _pump: pump,
+        });
+        cx.notify();
+    }
+
+    /// Прочитать поля диалога, сохранить их в настройки и запустить сессию.
+    fn start_collab_from_dialog(&mut self, cx: &mut Context<Self>) {
+        let room = {
+            let room = self.collab_room_input.read(cx).text().trim().to_string();
+            if room.is_empty() { "main".to_string() } else { room }
+        };
+        let name = {
+            let name = self.collab_name_input.read(cx).text().trim().to_string();
+            if name.is_empty() { "AIRcode".to_string() } else { name }
+        };
+        let session_cookie = std::env::var("AIRCODE_COLLAB_SESSION")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let (config, relay) = if self.collab_dialog_host {
+            let relay = match RelayHandle::spawn(([0, 0, 0, 0], 9415).into()) {
+                Ok(relay) => relay,
+                Err(error) => {
+                    self.status = format!("{}: {error}", self.tr("collab_failed"));
+                    cx.notify();
+                    return;
+                }
+            };
+            (
+                CollabConfig {
+                    server: format!("ws://127.0.0.1:{}", relay.addr().port()),
+                    room: room.clone(),
+                    session_cookie,
+                    user_name: name.clone(),
+                },
+                Some(relay),
+            )
+        } else {
+            let mut server = self.collab_address_input.read(cx).text().trim().to_string();
+            if server.is_empty() {
+                self.status = self.tr("collab_config_missing").to_string();
+                cx.notify();
+                return;
+            }
+            if !server.starts_with("ws://") && !server.starts_with("wss://") {
+                server = format!("ws://{server}");
+            }
+            (
+                CollabConfig {
+                    server: server.clone(),
+                    room: room.clone(),
+                    session_cookie,
+                    user_name: name.clone(),
+                },
+                None,
+            )
+        };
+        // Запоминаем введённые параметры для следующего запуска.
+        self.settings.collab_name = name;
+        self.settings.collab_room = room;
+        if !self.collab_dialog_host {
+            self.settings.collab_server = config.server.clone();
+        }
+        self.persist_settings();
+        self.collab_dialog_open = false;
+        self.start_collab(config, relay, cx);
+    }
+
+    /// Войти/выйти из голосового канала комнаты (Ctrl+Shift+V).
+    fn toggle_voice(&mut self, cx: &mut Context<Self>) {
+        let Some(collab) = &self.collab else {
+            self.status = self.tr("collab_voice_needs_session").to_string();
+            cx.notify();
+            return;
+        };
+        let command = if self.voice.joined {
+            CollabCommand::StopVoice
+        } else {
+            CollabCommand::StartVoice
+        };
+        let _ = collab.handle.cmd_tx.send(command);
+        cx.notify();
+    }
+
+    /// Выключить/включить микрофон в голосовом канале.
+    fn toggle_voice_mute(&mut self, cx: &mut Context<Self>) {
+        if let Some(collab) = &self.collab {
+            self.voice.muted = !self.voice.muted;
+            let _ = collab
+                .handle
+                .cmd_tx
+                .send(CollabCommand::SetVoiceMuted(self.voice.muted));
+            cx.notify();
+        }
+    }
+
+    /// Опрашивается pump-задачей: разбирает события актора и детектит
+    /// локальные правки активного документа.
+    fn collab_tick(&mut self, cx: &mut Context<Self>) {
+        let Some(collab) = self.collab.as_mut() else {
+            return;
+        };
+        // Сначала собираем события: обработка может снять `self.collab`.
+        let mut events = Vec::new();
+        while let Ok(event) = collab.handle.event_rx.try_recv() {
+            events.push(event);
+        }
+        let mut close_session = false;
+        for event in events {
+            match event {
+                CollabEvent::Started => {
+                    // В host-режиме не затираем адрес для друга.
+                    if self.collab.as_ref().is_none_or(|c| c.relay.is_none()) {
+                        self.status = self.tr("collab_started").to_string();
+                    }
+                }
+                CollabEvent::Synced(text) | CollabEvent::TextChanged(text) => {
+                    let Some(collab) = self.collab.as_mut() else {
+                        continue;
+                    };
+                    let document = collab.document.clone();
+                    let mut binding = std::mem::replace(&mut collab.binding, CollabBinding::new(""));
+                    let revision = document.update(cx, |view, cx| {
+                        let buffer = view.document().text().to_string();
+                        if let Some((start, delete, insert)) =
+                            binding.remote_change(&text, &buffer)
+                        {
+                            view.apply_remote_edit(start..start + delete, &insert, cx);
+                        }
+                        view.revision()
+                    });
+                    if let Some(collab) = self.collab.as_mut() {
+                        collab.binding = binding;
+                        collab.last_revision = revision;
+                    }
+                }
+                CollabEvent::PeersChanged(peers) => {
+                    self.collab_peers = peers
+                        .iter()
+                        .filter_map(|p| parse_peer(p.state_json.as_deref()))
+                        .collect();
+                }
+                CollabEvent::VoiceStarted => {
+                    self.voice.joined = true;
+                    self.status = self.tr("collab_voice_connecting").to_string();
+                }
+                CollabEvent::VoicePeerJoined(_) => {
+                    self.voice.peer_present = true;
+                }
+                CollabEvent::VoicePeerLeft => {
+                    self.voice.peer_present = false;
+                    self.voice.connected = false;
+                }
+                CollabEvent::VoiceRtcConnected => {
+                    self.voice.connected = true;
+                    self.status = self.tr("collab_voice_connected").to_string();
+                }
+                CollabEvent::VoiceStopped(reason) => {
+                    self.voice = VoiceUi::default();
+                    if !reason.is_empty() {
+                        self.status = reason;
+                    }
+                }
+                CollabEvent::Closed(reason) => {
+                    self.status = if reason.is_empty() {
+                        self.tr("collab_stopped").to_string()
+                    } else {
+                        format!("{}: {reason}", self.tr("collab_stopped"))
+                    };
+                    close_session = true;
+                }
+                CollabEvent::Failed(error) => {
+                    self.status = format!("{}: {error}", self.tr("collab_failed"));
+                    close_session = true;
+                }
+            }
+        }
+        if close_session {
+            self.collab = None;
+            self.collab_peers.clear();
+            self.voice = VoiceUi::default();
+            cx.notify();
+            return;
+        }
+        // Локальные правки (revision вырос не от наших remote-апдейтов).
+        let Some(collab) = self.collab.as_mut() else {
+            cx.notify();
+            return;
+        };
+        let revision = collab.document.read(cx).revision();
+        if revision != collab.last_revision {
+            collab.last_revision = revision;
+            let text = collab.document.read(cx).document().text().to_string();
+            let _ = collab.handle.cmd_tx.send(CollabCommand::LocalChange(text));
+        }
         cx.notify();
     }
 
@@ -1092,6 +1466,7 @@ impl Workspace {
         self.state.close_palette();
         self.settings_open = false;
         self.menu_open = false;
+        self.collab_dialog_open = false;
         self.pending_discard = None;
         self.close_confirmation_open = false;
         self.clear_history_confirmation_open = false;
@@ -3846,6 +4221,223 @@ impl Workspace {
                             .into_any_element()
                     })),
             )
+            .when(self.collab.is_some(), |this| {
+                this.child(self.collab_panel(theme, cx))
+            })
+    }
+
+    /// Панель участников совместной сессии и голосового канала
+    /// (Discord-стиль: снизу левой панели).
+    fn collab_panel(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let peers: Vec<CollabPeerView> = self
+            .collab_peers
+            .iter()
+            .filter(|p| p.name != "AIRcode" || self.collab_peers.len() > 1)
+            .cloned()
+            .collect();
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .border_t_1()
+            .border_color(theme.border)
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.faint)
+                    .child(self.tr("collab_participants").to_uppercase()),
+            )
+            .children(peers.into_iter().map(|peer| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(8.0))
+                            .rounded_full()
+                            .bg(gpui::rgba(peer.color)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_sm()
+                            .text_color(theme.muted)
+                            .child(peer.name),
+                    )
+                    .into_any_element()
+            }))
+            .child(if self.voice.joined {
+                let state_label = if self.voice.connected {
+                    self.tr("collab_voice_connected")
+                } else {
+                    self.tr("collab_voice_connecting")
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pt_1()
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(8.0))
+                            .rounded_full()
+                            .bg(if self.voice.connected {
+                                theme.green
+                            } else {
+                                theme.faint
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted)
+                            .child(state_label),
+                    )
+                    .child(
+                        action_button(
+                            if self.voice.muted {
+                                self.tr("collab_unmute")
+                            } else {
+                                self.tr("collab_mute")
+                            },
+                            "collab-mute",
+                            self.voice.muted,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_voice_mute(cx))),
+                    )
+                    .child(
+                        action_button(self.tr("collab_voice_leave"), "collab-leave", false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_voice(cx))),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .pt_1()
+                    .child(
+                        action_button(
+                            self.tr("collab_voice_join"),
+                            "collab-join-voice",
+                            false,
+                            theme,
+                        )
+                        .w_full()
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_voice(cx))),
+                    )
+                    .into_any_element()
+            })
+    }
+
+    /// Диалог совместной сессии: создать комнату (встроенный релей) или
+    /// присоединиться к комнате друга по адресу `ws://<ip>:<port>`.
+    fn collab_dialog(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let host = self.collab_dialog_host;
+        div()
+            .debug_selector(|| "qa-collab_dialog".to_string())
+            .id("collab-dialog")
+            .absolute()
+            .top(px(72.0))
+            .left_0()
+            .right_0()
+            .mx_auto()
+            .w_full()
+            .max_w(px(460.0))
+            .flex()
+            .flex_col()
+            .occlude()
+            .rounded_xl()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .p_4()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .whitespace_normal()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.tr("collab_dialog_title")),
+                    )
+                    .child(
+                        action_button(self.tr("cancel"), "close-collab-dialog", false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.close_overlays(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                action_button(
+                                    self.tr("collab_mode_host"),
+                                    "collab-mode-host",
+                                    host,
+                                    theme,
+                                )
+                                .flex_1()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.collab_dialog_host = true;
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                action_button(
+                                    self.tr("collab_mode_join"),
+                                    "collab-mode-join",
+                                    !host,
+                                    theme,
+                                )
+                                .flex_1()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.collab_dialog_host = false;
+                                    cx.notify();
+                                })),
+                            ),
+                    )
+                    .child(field_label(self.tr("collab_name"), theme))
+                    .child(input_container(theme).child(self.collab_name_input.clone()))
+                    .child(field_label(self.tr("collab_room"), theme))
+                    .child(input_container(theme).child(self.collab_room_input.clone()))
+                    .when(!host, |this| {
+                        this.child(field_label(self.tr("collab_address"), theme))
+                            .child(input_container(theme).child(self.collab_address_input.clone()))
+                    })
+                    .child(
+                        action_button(self.tr("collab_start"), "collab-start", true, theme)
+                            .w_full()
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.start_collab_from_dialog(cx)),
+                            ),
+                    ),
+            )
     }
 
     fn terminal_resize_handle(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5795,6 +6387,7 @@ impl Render for Workspace {
                 FocusTarget::Terminal => self.terminal.read(cx).focus_handle(cx),
                 FocusTarget::Palette => self.palette_input.read(cx).focus_handle(cx),
                 FocusTarget::Menu => self.menu_focus.clone(),
+                FocusTarget::Collab => self.collab_name_input.read(cx).focus_handle(cx),
                 FocusTarget::Settings => {
                     if self.settings.provider.model_options().is_empty() {
                         self.model_input.read(cx).focus_handle(cx)
@@ -5860,6 +6453,9 @@ impl Render for Workspace {
             })
             .when(self.settings_open, |this| {
                 this.child(self.settings_panel(theme, cx))
+            })
+            .when(self.collab_dialog_open, |this| {
+                this.child(self.collab_dialog(theme, cx))
             })
             .when(self.menu_open, |this| this.child(self.top_menu(theme, cx)))
             .when(self.clear_history_confirmation_open, |this| {

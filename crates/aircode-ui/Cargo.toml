@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 aircode-agent.workspace = true
 aircode-ai.workspace = true
+aircode-collab = { workspace = true, features = ["voice"] }
+aircode-collab-relay.workspace = true
 aircode-core.workspace = true
 aircode-editor.workspace = true
 aircode-i18n.workspace = true

@@ -277,6 +277,49 @@ impl Document {
         Ok(())
     }
 
+    /// Apply an edit that arrived from a collaboration session.
+    ///
+    /// Unlike [`Self::replace_range`], this never touches the undo stack
+    /// (remote changes are not undone by the local Ctrl+Z), keeps the local
+    /// cursor where it was (clamped/shifted by the edit), and clears redo —
+    /// consistent with how VS Code Live Share applies remote edits.
+    pub fn apply_remote_edit(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+    ) -> Result<(), DocumentError> {
+        if range.start > range.end
+            || range.end > self.text.len()
+            || !self.text.is_char_boundary(range.start)
+            || !self.text.is_char_boundary(range.end)
+        {
+            return Err(DocumentError::InvalidRange);
+        }
+        if range.is_empty() && replacement.is_empty() {
+            return Ok(());
+        }
+        let removed = range.end - range.start;
+        let inserted = replacement.len();
+        // Сдвиг позиции каретки: правки до курсора сдвигают его, правки
+        // поверх выделения схлопывают его в точку начала правки.
+        let shift = |pos: usize| -> usize {
+            if pos <= range.start {
+                pos
+            } else if pos >= range.end {
+                pos + inserted - removed
+            } else {
+                range.start
+            }
+        };
+        let sel_start = shift(self.selection.start);
+        let sel_end = shift(self.selection.end);
+        self.text.replace_range(range.clone(), replacement);
+        self.reindex();
+        self.selection = sel_start..sel_end;
+        self.redo.clear();
+        Ok(())
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(edit) = self.undo.pop() else {
             return false;
@@ -430,6 +473,45 @@ mod tests {
         assert!(document.redo());
         assert_eq!(document.text(), "ax\r\nb");
         assert_eq!(document.line_range(0), 0..2);
+    }
+
+    #[test]
+    fn remote_edit_skips_undo_and_shifts_cursor() {
+        let mut document = Document::from_text("hello world");
+        document.set_selection(11..11).unwrap();
+
+        document.apply_remote_edit(0..0, ">> ".into()).unwrap();
+
+        assert_eq!(document.text(), ">> hello world");
+        assert_eq!(document.selection(), 14..14);
+        // Удалённая правка не попадает в локальный undo.
+        assert!(!document.undo());
+        assert_eq!(document.text(), ">> hello world");
+    }
+
+    #[test]
+    fn remote_edit_over_selection_tracks_content() {
+        let mut document = Document::from_text("abcdef");
+        document.set_selection(1..5).unwrap();
+
+        // Удалённая замена "cd" -> "XYZ": выделение «прилипает» к своему
+        // содержимому (как sticky-диапазоны в Live Share).
+        document.apply_remote_edit(2..4, "XYZ".into()).unwrap();
+
+        assert_eq!(document.text(), "abXYZef");
+        assert_eq!(document.selection(), 1..6);
+    }
+
+    #[test]
+    fn remote_edit_under_cursor_collapses_to_edit_start() {
+        let mut document = Document::from_text("abcdef");
+        document.set_selection(3..3).unwrap();
+
+        // Правка накрывает саму каретку — она схлопывается в начало правки.
+        document.apply_remote_edit(2..4, "XYZ".into()).unwrap();
+
+        assert_eq!(document.text(), "abXYZef");
+        assert_eq!(document.selection(), 2..2);
     }
 
     #[test]

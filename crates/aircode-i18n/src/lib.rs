@@ -420,6 +420,58 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
         (Language::Russian, "terminal_starting") => "Запуск системной оболочки...",
         (Language::Russian, "terminal_exited") => "Работа оболочки завершена",
         (Language::Russian, "terminal_start_failed") => "Не удалось запустить терминал",
+        (Language::English, "collab_started") => "Collab session started",
+        (Language::English, "collab_stopped") => "Collab session stopped",
+        (Language::English, "collab_failed") => "Collab session failed",
+        (Language::English, "collab_config_missing") => {
+            "Host: set AIRCODE_COLLAB_HOST=1. Join: set AIRCODE_COLLAB_SERVER and AIRCODE_COLLAB_ROOM"
+        }
+        (Language::English, "collab_peers") => "collaborators online",
+        (Language::English, "collab_host_listening") => "Collab hosted, share this address",
+        (Language::English, "collab_participants") => "Participants",
+        (Language::English, "collab_voice_join") => "Join voice",
+        (Language::English, "collab_voice_leave") => "Leave",
+        (Language::English, "collab_mute") => "Mute",
+        (Language::English, "collab_unmute") => "Unmute",
+        (Language::English, "collab_voice_needs_session") => {
+            "Start a collab session first (Ctrl+Shift+L)"
+        }
+        (Language::English, "collab_voice_connected") => "Voice connected",
+        (Language::English, "collab_voice_connecting") => "Voice: connecting...",
+        (Language::English, "collab_dialog_title") => "Collab session",
+        (Language::English, "collab_mode_host") => "Host",
+        (Language::English, "collab_mode_join") => "Join",
+        (Language::English, "collab_address") => "Friend's address (ws://ip:9415)",
+        (Language::English, "collab_room") => "Room",
+        (Language::English, "collab_name") => "Your name",
+        (Language::English, "collab_start") => "Start",
+        (Language::English, "cancel") => "Cancel",
+        (Language::Russian, "collab_started") => "Совместная сессия запущена",
+        (Language::Russian, "collab_stopped") => "Совместная сессия остановлена",
+        (Language::Russian, "collab_failed") => "Совместная сессия завершилась ошибкой",
+        (Language::Russian, "collab_config_missing") => {
+            "Хост: задайте AIRCODE_COLLAB_HOST=1. Гость: AIRCODE_COLLAB_SERVER и AIRCODE_COLLAB_ROOM"
+        }
+        (Language::Russian, "collab_peers") => "участников онлайн",
+        (Language::Russian, "collab_host_listening") => "Сессия поднята, отправьте адрес другу",
+        (Language::Russian, "collab_participants") => "Участники",
+        (Language::Russian, "collab_voice_join") => "Войти в голос",
+        (Language::Russian, "collab_voice_leave") => "Выйти",
+        (Language::Russian, "collab_mute") => "Без звука",
+        (Language::Russian, "collab_unmute") => "Включить микрофон",
+        (Language::Russian, "collab_voice_needs_session") => {
+            "Сначала запустите совместную сессию (Ctrl+Shift+L)"
+        }
+        (Language::Russian, "collab_voice_connected") => "Голос подключён",
+        (Language::Russian, "collab_voice_connecting") => "Голос: подключение...",
+        (Language::Russian, "collab_dialog_title") => "Совместная сессия",
+        (Language::Russian, "collab_mode_host") => "Создать",
+        (Language::Russian, "collab_mode_join") => "Присоединиться",
+        (Language::Russian, "collab_address") => "Адрес друга (ws://ip:9415)",
+        (Language::Russian, "collab_room") => "Комната",
+        (Language::Russian, "collab_name") => "Ваше имя",
+        (Language::Russian, "collab_start") => "Старт",
+        (Language::Russian, "cancel") => "Отмена",
         (_, unknown) => unknown,
     }
 }
@@ -482,6 +534,38 @@ mod tests {
             "terminal_start_failed",
         ];
         for key in keys {
+            assert_ne!(tr(Language::English, key), key);
+            assert_ne!(tr(Language::Russian, key), key);
+            assert_ne!(tr(Language::English, key), tr(Language::Russian, key));
+        }
+    }
+
+    #[test]
+    fn collab_labels_are_localized() {
+        for key in [
+            "collab_started",
+            "collab_stopped",
+            "collab_failed",
+            "collab_config_missing",
+            "collab_peers",
+            "collab_host_listening",
+            "collab_participants",
+            "collab_voice_join",
+            "collab_voice_leave",
+            "collab_mute",
+            "collab_unmute",
+            "collab_voice_needs_session",
+            "collab_voice_connected",
+            "collab_voice_connecting",
+            "collab_dialog_title",
+            "collab_mode_host",
+            "collab_mode_join",
+            "collab_address",
+            "collab_room",
+            "collab_name",
+            "collab_start",
+            "cancel",
+        ] {
             assert_ne!(tr(Language::English, key), key);
             assert_ne!(tr(Language::Russian, key), key);
             assert_ne!(tr(Language::English, key), tr(Language::Russian, key));

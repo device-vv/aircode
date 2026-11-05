@@ -1,0 +1,20 @@
+[package]
+name = "aircode-collab-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3.31"
+serde_json = { workspace = true }
+
+[lib]
+name = "aircode_collab_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aircode-relay"
+path = "src/main.rs"

@@ -299,6 +299,27 @@ impl DocumentView {
         &mut self.document
     }
 
+    /// Счётчик правок; растёт при любом изменении текста.
+    /// Используется collab-потоком, чтобы замечать локальные правки.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Применить правку, пришедшую из collab-сессии (без undo, курсор
+    /// сдвигается корректно — см. `Document::apply_remote_edit`).
+    pub fn apply_remote_edit(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document.apply_remote_edit(range, replacement).is_ok() {
+            self.revision = self.revision.wrapping_add(1);
+            self.cancel_completion();
+            cx.notify();
+        }
+    }
+
     pub fn completion_context(&self) -> Option<(u64, usize, Vec<aircode_ai::ChatMessage>)> {
         let cursor = self.completion_cursor()?;
         let language = self
